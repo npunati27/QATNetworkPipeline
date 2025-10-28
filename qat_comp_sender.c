@@ -1,5 +1,3 @@
-// Compile with: gcc -o qat_sender qat_compressed_sender.c -lqat -lusdm -lpthread
-
 #include <qat/cpa.h>              
 #include <qat/cpa_dc.h>           
 #include <qat/icp_sal_user.h>     
@@ -46,53 +44,55 @@ typedef struct {
 } __attribute__((packed)) compression_header_t;
 
 typedef struct {
-    uint8_t *data;
-    size_t length;
-    bool is_compressed;
-    compression_header_t *header;  
-} send_queue_entry_t;
-
-typedef struct {
-    send_queue_entry_t entries[SEND_QUEUE_SIZE];
-    volatile uint32_t head;
-    volatile uint32_t tail;
-    uint32_t mask;
-    char pad[CACHE_LINE_SIZE];
-} __attribute__((aligned(CACHE_LINE_SIZE))) send_queue_t;
-
-// Ring buffer entry with QAT-specific fields
-typedef struct {
-    // Job tracking
     volatile job_status_t status;
     uint64_t sequence_number;
     
-    // QAT buffer structures - MUST be allocated with qaeMemAlloc
     CpaBufferList *pSrcBuffer;
     CpaBufferList *pDstBuffer;
     CpaFlatBuffer *pFlatSrcBuffer;
     CpaFlatBuffer *pFlatDstBuffer;
     
-    // Actual data pointers (within QAT-allocated memory)
     Cpa8U *pSrcData;
     Cpa8U *pDstData;
     
-    // Data sizes
     Cpa32U srcDataSize;
     Cpa32U dstDataSize;
-    Cpa32U producedSize;  // Actual compressed size
+    Cpa32U producedSize;  
     
-    // QAT results structure
     CpaDcRqResults dcResults;
     
-    // Network header
     compression_header_t header;
     
-    // Timestamps for performance tracking
     uint64_t submit_time;
     uint64_t complete_time;
 } ring_entry_t;
 
-// Main ring buffer structure
+typedef struct {
+    ring_entry_t *entry; 
+} compressed_send_entry_t;
+
+typedef struct {
+    compressed_send_entry_t entries[SEND_QUEUE_SIZE];
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    uint32_t mask;
+    char pad[CACHE_LINE_SIZE];
+} __attribute__((aligned(CACHE_LINE_SIZE))) compressed_send_queue_t;
+
+typedef struct {
+    uint8_t *data;        
+    size_t length;
+    uint64_t sequence_number;
+} uncompressed_send_entry_t;
+
+typedef struct {
+    uncompressed_send_entry_t entries[SEND_QUEUE_SIZE];
+    volatile uint32_t head;
+    volatile uint32_t tail;
+    uint32_t mask;
+    char pad[CACHE_LINE_SIZE];
+} __attribute__((aligned(CACHE_LINE_SIZE))) uncompressed_send_queue_t;
+
 typedef struct {
     ring_entry_t entries[RING_SIZE];
     int compression_level;
@@ -119,8 +119,8 @@ typedef struct {
     int socket_fd;
     volatile bool running;
 
-    send_queue_t compressed_send_queue;
-    send_queue_t uncompressed_send_queue;
+    compressed_send_queue_t compressed_send_queue;
+    uncompressed_send_queue_t uncompressed_send_queue;
     
     volatile uint64_t sequence_counter;
     volatile uint64_t uncompressed_packets_sent;
@@ -140,10 +140,8 @@ typedef struct {
 
 } ring_buffer_t;
 
-// Global pointer for callbacks
 static ring_buffer_t *g_ring = NULL;
 
-// Callback function called by QAT when compression completes
 void qat_dc_callback(void *pCallbackTag, CpaStatus status)
 {
     static uint64_t callback_count = 0;
@@ -155,7 +153,6 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         uint64_t compression_time = clock() - entry->submit_time;
         uint64_t time_us = (compression_time * 1000000) / CLOCKS_PER_SEC;
         
-        // Update stats atomically
         __sync_fetch_and_add(&g_ring->qat_stats.total_compressions, 1);
         __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_in, entry->srcDataSize);
         __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_out, entry->producedSize);
@@ -169,6 +166,7 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         
         __sync_synchronize();
         entry->status = JOB_COMPLETED;
+        __sync_synchronize();
         
         if (callback_count % 10000 == 0) {
             printf("Callback: %lu successful compressions\n", callback_count);
@@ -182,7 +180,6 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
     entry->complete_time = clock();
 }
 
-// Initialize QAT device and session
 int qat_init(ring_buffer_t *ring)
 {
     CpaStatus status;
@@ -191,14 +188,12 @@ int qat_init(ring_buffer_t *ring)
     Cpa32U sessionSize = 0;
     Cpa32U contextSize = 0;
     
-    // Step 1: Start the QAT user process
     status = icp_sal_userStartMultiProcess("SSL", CPA_FALSE);
     if (status != CPA_STATUS_SUCCESS) {
         printf("Failed to start QAT process: %d\n", status);
         return -1;
     }
     
-    // Step 2: Get available DC (Data Compression) instances
     status = cpaDcGetNumInstances(&numInstances);
     if (status != CPA_STATUS_SUCCESS || numInstances == 0) {
         printf("No QAT DC instances available\n");
@@ -213,7 +208,6 @@ int qat_init(ring_buffer_t *ring)
         return -1;
     }
     
-    // Step 3: Use the first available instance
     ring->dcInstance = instances[0];
     free(instances);
 
@@ -224,8 +218,7 @@ int qat_init(ring_buffer_t *ring)
         return -1;
     }
     
-    // Step 4: Start the DC instance
-    Cpa16U numBuffers = 512;  // Number of intermediate buffers
+    Cpa16U numBuffers = 512; 
     status = cpaDcStartInstance(ring->dcInstance, numBuffers, NULL);
     if (status != CPA_STATUS_SUCCESS) {
         printf("Failed to start DC instance: %d\n", status);
@@ -247,17 +240,15 @@ int qat_init(ring_buffer_t *ring)
     } 
 
     
-    // Step 5: Set up compression session parameters
     ring->sessionSetupData.compLevel = qat_level;              // Fastest compression
     ring->sessionSetupData.compType = CPA_DC_DEFLATE;          // Standard DEFLATE
     ring->sessionSetupData.huffType = CPA_DC_HT_STATIC;        // Static Huffman for speed
     ring->sessionSetupData.autoSelectBestHuffmanTree = CPA_FALSE;
     ring->sessionSetupData.sessDirection = CPA_DC_DIR_COMPRESS;
-    ring->sessionSetupData.sessState = CPA_DC_STATELESS;       // Each operation independent
+    ring->sessionSetupData.sessState = CPA_DC_STATELESS;       
     ring->sessionSetupData.checksum = CPA_DC_CRC32;
-    ring->sessionSetupData.windowSize = 15;                     // 2^7 = 128 byte window
+    ring->sessionSetupData.windowSize = 15;                     
     
-    // Step 6: Get required session memory size
     status = cpaDcGetSessionSize(ring->dcInstance, 
                                  &ring->sessionSetupData,
                                  &sessionSize, 
@@ -267,7 +258,6 @@ int qat_init(ring_buffer_t *ring)
         return -1; 
     }
     
-    // Step 7: Allocate session memory (must be from QAT memory)
     void *pSessionMemory = qaeMemAllocNUMA(sessionSize, 0, 64);
     if (pSessionMemory == NULL) {
         printf("Failed to allocate session memory\n");
@@ -275,7 +265,6 @@ int qat_init(ring_buffer_t *ring)
     }
 
     ring->sessionHandle = pSessionMemory;
-    // Step 8: Initialize the session
     status = cpaDcInitSession(ring->dcInstance,
                              ring->sessionHandle,
                              &ring->sessionSetupData,
@@ -292,13 +281,11 @@ int qat_init(ring_buffer_t *ring)
     return 0;
 }
 
-// Allocate QAT-compatible buffers for a ring entry
 int allocate_qat_buffers(ring_entry_t *entry, CpaInstanceHandle dcInstance)
 {
     Cpa32U metaSize = 0;
     CpaStatus status;
     
-    // Get required metadata size for buffer lists
     status = cpaDcBufferListGetMetaSize(dcInstance, 1, &metaSize);
     if (status != CPA_STATUS_SUCCESS) {
         printf("Failed to get metadata size\n");
@@ -316,30 +303,24 @@ int allocate_qat_buffers(ring_entry_t *entry, CpaInstanceHandle dcInstance)
         entry->pSrcBuffer->pPrivateMetaData = NULL;
     }
     
-    // Allocate flat buffer structure for source
     entry->pFlatSrcBuffer = qaeMemAllocNUMA(sizeof(CpaFlatBuffer), 0, 64);
     if (!entry->pFlatSrcBuffer) return -1;
     
-    // Allocate actual source data buffer
     entry->pSrcData = qaeMemAllocNUMA(MAX_BUFFER_SIZE, 0, 64);
     if (!entry->pSrcData) return -1;
     
-    // Set up source buffer list
     entry->pSrcBuffer->pBuffers = entry->pFlatSrcBuffer;
     entry->pSrcBuffer->numBuffers = 1;
     
     entry->pFlatSrcBuffer->pData = entry->pSrcData;
-    entry->pFlatSrcBuffer->dataLenInBytes = 0;  // Set when data copied
+    entry->pFlatSrcBuffer->dataLenInBytes = 0; 
     
-    // Allocate destination buffer list structure
     entry->pDstBuffer = qaeMemAllocNUMA(sizeof(CpaBufferList), 0, 64);
     if (!entry->pDstBuffer) return -1;
     
-    // Allocate flat buffer structure for destination
     entry->pFlatDstBuffer = qaeMemAllocNUMA(sizeof(CpaFlatBuffer), 0, 64);
     if (!entry->pFlatDstBuffer) return -1;
 
-    // Allocate metadata for destination buffer list
     if (metaSize > 0) {
         entry->pDstBuffer->pPrivateMetaData = qaeMemAllocNUMA(metaSize, 0, 64);
         if (!entry->pDstBuffer->pPrivateMetaData) return -1;
@@ -347,11 +328,9 @@ int allocate_qat_buffers(ring_entry_t *entry, CpaInstanceHandle dcInstance)
         entry->pDstBuffer->pPrivateMetaData = NULL;
     }
     
-    // Allocate actual destination data buffer (2x for worst case expansion)
     entry->pDstData = qaeMemAllocNUMA(MAX_BUFFER_SIZE * 2, 0, 64);
     if (!entry->pDstData) return -1;
     
-    // Set up destination buffer list
     entry->pDstBuffer->pBuffers = entry->pFlatDstBuffer;
     entry->pDstBuffer->numBuffers = 1;
     
@@ -373,9 +352,20 @@ ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction
     ring->compressed_send_queue.mask = SEND_QUEUE_SIZE - 1;
     ring->uncompressed_send_queue.mask = SEND_QUEUE_SIZE - 1; 
 
+    ring->compressed_send_queue.head = 0;
+    ring->compressed_send_queue.tail = 0;
+    ring->compressed_send_queue.mask = SEND_QUEUE_SIZE - 1;
+
+    ring->uncompressed_send_queue.head = 0;
+    ring->uncompressed_send_queue.tail = 0;
+    ring->uncompressed_send_queue.mask = SEND_QUEUE_SIZE - 1;
+
     for (int i = 0; i < SEND_QUEUE_SIZE; i++) {
-        ring->compressed_send_queue.entries[i].data = malloc(MAX_BUFFER_SIZE * 2);
         ring->uncompressed_send_queue.entries[i].data = malloc(MAX_BUFFER_SIZE);
+        if (!ring->uncompressed_send_queue.entries[i].data) {
+            printf("Failed to allocate uncompressed buffer\n");
+            return NULL;
+        }
     }
     
     if (qat_init(ring) != 0) {
@@ -429,10 +419,17 @@ void* producer_thread(void *arg)
                 }
                 //usleep(10);
                 continue;  // Retry
+            }            
+            ring_entry_t *entry = &ring->entries[current_tail];
+            if(entry->status != JOB_EMPTY) {
+                ring_full_count++;
+                if (ring_full_count % 1000000000 == 0) {
+                    printf("Producer: Ring buffer full, ENTRY STATUS NONEMPTY (count: %lu)\n", ring_full_count);
+                }
+                //usleep(10);
+                continue;
             }
             ring_full_count = 0;
-            
-            ring_entry_t *entry = &ring->entries[current_tail];
             
             if (!ring->running) break;
             
@@ -485,11 +482,10 @@ void* producer_thread(void *arg)
             }
             
         } else {
-            send_queue_t *queue = &ring->uncompressed_send_queue;
+            uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
             uint32_t tail = queue->tail;
             uint32_t next_tail = (tail + 1) & queue->mask;
             
-            // Check if queue is full
             if (next_tail == queue->head) {
                 queue_full_count++;
                 if (queue_full_count % 10000 == 0) {
@@ -499,15 +495,14 @@ void* producer_thread(void *arg)
                 continue;  
             }
             
-            send_queue_entry_t *entry = &queue->entries[tail];
+            uncompressed_send_entry_t *entry = &queue->entries[tail];
             memcpy(entry->data, test_data, sizeof(test_data));
             entry->length = sizeof(test_data);
-            entry->is_compressed = false;
-            entry->header = NULL;
+            entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
             
             __sync_synchronize();
             queue->tail = next_tail;
-            ring->producer.jobs_submitted++;  
+            ring->producer.jobs_submitted++;   
         }
         
         //usleep(10); 
@@ -520,120 +515,60 @@ void* producer_thread(void *arg)
 void* consumer_thread(void *arg)
 {
     ring_buffer_t *ring = (ring_buffer_t *)arg;
-    CpaStatus status;
-    uint64_t poll_count = 0;
-    uint64_t no_progress_count = 0;
-    uint32_t last_head = 0;
     uint64_t send_count = 0;
+    uint64_t stuck_count = 0;
+    uint64_t compressed_full = 0;
     
     printf("Consumer thread started\n");
     
     while (ring->running) {
-        // ALWAYS poll QAT, even if nothing seems ready
-        status = icp_sal_DcPollInstance(ring->dcInstance, 0);
-        // poll_count++;
-        
-        // if (ring->consumer.head == last_head) {
-        //     no_progress_count++;
-        // } else {
-        //     no_progress_count = 0;
-        //     last_head = ring->consumer.head;
-        // }
-        
-        // // Diagnostic: Check for stuck operations periodically
-        // if (poll_count % 10000 == 0) {
-        //     int stuck_jobs = 0;
-        //     uint32_t oldest_stuck = UINT32_MAX;
-            
-        //     for (int i = 0; i < RING_SIZE; i++) {
-        //         if (ring->entries[i].status == JOB_SUBMITTED) {
-        //             stuck_jobs++;
-        //             if (oldest_stuck == UINT32_MAX) {
-        //                 oldest_stuck = i;
-        //             }
-        //         }
-        //     }
-            
-        //     if (stuck_jobs > 0) {
-        //         printf("Consumer: %d operations stuck in SUBMITTED state (oldest: entry %u)\n", 
-        //                stuck_jobs, oldest_stuck);
-                
-        //         for (int retry = 0; retry < 100; retry++) {
-        //             status = icp_sal_DcPollInstance(ring->dcInstance, 0);
-        //             if (status != CPA_STATUS_SUCCESS && status != CPA_STATUS_RETRY) {
-        //                 printf("Consumer: Poll failed with status %d\n", status);
-        //                 break;
-        //             }
-        //             //usleep(10);
-        //         }
-                
-        //         if (ring->entries[oldest_stuck].status == JOB_SUBMITTED) {
-        //             printf("Consumer: Entry %u still stuck after aggressive polling\n", oldest_stuck);
-                    
-        //             if (no_progress_count > 100000) { 
-        //                 printf("Consumer: WARNING - Marking stuck entry %u as ERROR\n", oldest_stuck);
-        //                 ring->entries[oldest_stuck].status = JOB_ERROR;
-        //                 no_progress_count = 0;
-        //             }
-        //         }
-        //     }
-        // }
+        icp_sal_DcPollInstance(ring->dcInstance, 64);
         
         uint32_t current_head = ring->consumer.head;
         ring_entry_t *entry = &ring->entries[current_head];
-        uint64_t still_submitted = 0;
-        uint64_t status_other = 0;
+        job_status_t current_status = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
         
-        if (entry->status == JOB_COMPLETED) {
-            send_queue_t *queue = &ring->compressed_send_queue;
-            uint32_t tail = queue->tail;
-            uint32_t next_tail = (tail + 1) & queue->mask;
+        if (current_status == JOB_COMPLETED) {
+            stuck_count = 0;
+            compressed_send_queue_t *queue = &ring->compressed_send_queue;
+            uint32_t next_tail = (queue->tail + 1) & queue->mask;
             
             if (next_tail == queue->head) {
-                printf("Consumer: no space in the compressed send queue....\n");
+                if(compressed_full % 1000000 == 0) {
+                    printf("Consumer: Compressed Queue Full, We are Spinning...\n");
+                }
+                compressed_full++;
                 continue;
             }
             
-            send_queue_entry_t *send_entry = &queue->entries[tail];
-            
-            if (!send_entry->header) {
-                send_entry->header = malloc(sizeof(compression_header_t));
-            }
-            memcpy(send_entry->header, &entry->header, sizeof(compression_header_t));
-            memcpy(send_entry->data, entry->pDstData, entry->producedSize);
-            send_entry->length = entry->producedSize;
-            send_entry->is_compressed = true;
+            queue->entries[queue->tail].entry = entry;
             
             __sync_synchronize();
             queue->tail = next_tail;
             
-            entry->status = JOB_EMPTY;
             ring->consumer.jobs_sent++;
             ring->consumer.head = (current_head + 1) & ring->mask;
+            
             send_count++;
-            if(send_count % 10000  == 0) {
+            if (send_count % 10000 == 0) {
                 printf("Consumer: Sent %lu entries to network thread\n", send_count);
             }
             
-        } else if (entry->status == JOB_ERROR) {
-            printf("Consumer: Skipping error entry at %u\n", current_head);
+        } else if (current_status == JOB_ERROR) {
             entry->status = JOB_EMPTY;
             ring->consumer.head = (current_head + 1) & ring->mask;
-            
-        } else if (entry->status == JOB_SUBMITTED) {
-            //usleep(1);
-            still_submitted++;
-            if(still_submitted % 10000 == 0) {
-                printf("Consumer: Job is still in status SUBMITTED\n");
-            }
-            continue;
-        } else {
-            status_other++;
-            if(status_other % 10000 == 0) {
-                printf("Consumer: Job is in status OTHER\n");
-            }
-            continue;
-            //usleep(1);
+            stuck_count = 0;
+        } else if (current_status == JOB_SUBMITTED) {
+            stuck_count++;
+            if(stuck_count % 1000000 == 0) {
+                printf("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
+                printf("  Forcing to ERROR state and skipping...\n");
+                entry->status = JOB_ERROR;
+                ring->consumer.head = (current_head + 1) & ring->mask;
+                stuck_count = 0;
+
+            } 
+            __builtin_ia32_pause();
         }
     }
     
@@ -644,16 +579,15 @@ void* consumer_thread(void *arg)
 void* network_sender_thread(void *arg)
 {
     ring_buffer_t *ring = (ring_buffer_t *)arg;
-    struct iovec iov[2];
-    int no_data_counter = 0;
     uint64_t last_packets_sent = 0;
     time_t last_report_time = time(NULL);
+    uint64_t sent_entries = 0;
+    uint64_t no_data_counter = 0;
     
     printf("Network sender thread started\n");
     
     while (ring->running) {
         bool sent_something = false;
-        
         time_t now = time(NULL);
         if (now - last_report_time >= 5) {  
             uint64_t current_packets = ring->compressed_packets_sent + ring->uncompressed_packets_sent;
@@ -670,84 +604,90 @@ void* network_sender_thread(void *arg)
             last_report_time = now;
         }
         
-        send_queue_t *comp_queue = &ring->compressed_send_queue;
-        if (comp_queue->head != comp_queue->tail) {
-            send_queue_entry_t *entry = &comp_queue->entries[comp_queue->head];
+        // Process COMPRESSED queue
+        compressed_send_queue_t *comp_queue = &ring->compressed_send_queue;
+        while (comp_queue->head != comp_queue->tail) {
+            compressed_send_entry_t *send_msg = &comp_queue->entries[comp_queue->head];
+            ring_entry_t *entry = send_msg->entry;
             
             if (ring->socket_fd > 0) {
-                // iov[0].iov_base = entry->header;
-                // iov[0].iov_len = sizeof(compression_header_t);
-                // iov[1].iov_base = entry->data;
-                // iov[1].iov_len = entry->length;
-
-                // size_t total_expected = sizeof(compression_header_t) + entry->length;
-                // ssize_t sent = writev(ring->socket_fd, iov, 2);
+                struct iovec iov[2];
+                iov[0].iov_base = &entry->header;
+                iov[0].iov_len = sizeof(compression_header_t);
+                iov[1].iov_base = entry->pDstData;
+                iov[1].iov_len = entry->producedSize;
                 
-                // if (sent == total_expected) {
-                //     ring->consumer.bytes_sent += entry->length;
-                //     __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
-                //     free(entry->header);
-                //     entry->header = NULL; 
-                //     comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
-                //     sent_something = true;
-                //     no_data_counter = 0;
-                // } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                //     __sync_fetch_and_add(&ring->socket_blocked_count, 1);
-                //     usleep(100); 
-                // } else if (sent < 0) {
-                //     if (!ring->running) break;
-                //     perror("writev failed");
-                //     usleep(1000);
+                ssize_t sent = writev(ring->socket_fd, iov, 2);
+                
+                if (sent == sizeof(compression_header_t) + entry->producedSize) {
+                    ring->consumer.bytes_sent += entry->producedSize;
+                    __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
+                    
+                    entry->status = JOB_EMPTY;
+                    sent_entries++;
+                    if(sent_entries % 10000 == 0) {
+                        printf("Network Send Thread: Sent %lu entries\n", sent_entries);
+                    }
+                    sent_something = true;
+                    comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
+                } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    __sync_fetch_and_add(&ring->socket_blocked_count, 1);
+                    usleep(10);
+                    break;  
+                } else {
+                    perror("compressed send failed");
+                    entry->status = JOB_EMPTY;
+                    comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
+                }
+
+                // entry->status = JOB_EMPTY;
+                // __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
+                // comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
+                // sent_something = true;
+                // sent_entries++;
+                // if(sent_entries % 10000 == 0) {
+                //     printf("Network Send Thread: Sent %lu entries\n", sent_entries);
                 // }
-                free(entry->header);
-                entry->header = NULL; 
-                comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
-                sent_something = true;
             }
         }
         
-        // Priority 2: Uncompressed queue
-        if (!sent_something) {
-            send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
-            if (uncomp_queue->head != uncomp_queue->tail) {
-                send_queue_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
+        // Process UNCOMPRESSED queue
+        if(!sent_something) {
+            uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
+            while (uncomp_queue->head != uncomp_queue->tail) {
+                uncompressed_send_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
                 
                 if (ring->socket_fd > 0) {
-                    ssize_t sent = send(ring->socket_fd, entry->data, entry->length, MSG_NOSIGNAL);
+                    ssize_t sent = send(ring->socket_fd, entry->data, 
+                                       entry->length, MSG_DONTWAIT);
                     
                     if (sent == entry->length) {
                         ring->consumer.bytes_sent += entry->length;
                         __sync_fetch_and_add(&ring->uncompressed_packets_sent, 1);
-                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                         sent_something = true;
-                        no_data_counter = 0;
+                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         __sync_fetch_and_add(&ring->socket_blocked_count, 1);
-                        //usleep(100);
-                    } else if (sent < 0) {
-                        if (!ring->running) break;
-                        perror("send failed");
-                        //usleep(1000);
+                        usleep(10);
+                        break;
+                    } else {
+                        perror("uncompressed send failed");
+                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     }
-                }
+                } 
             }
+            
         }
-        
-        // if (!sent_something) {
-        //     no_data_counter++;
-        //     if (no_data_counter % 10000 == 0) {  // Reduced frequency
-        //         printf("Network: No data to send (count: %d)\n", no_data_counter);
-        //                         send_queue_t *comp = &ring->compressed_send_queue;
-        //         send_queue_t *uncomp = &ring->uncompressed_send_queue;
-        //         printf("  Compressed queue: head=%u tail=%u (empty=%d)\n",
-        //                comp->head, comp->tail, comp->head == comp->tail);
-        //         printf("  Uncompressed queue: head=%u tail=%u (empty=%d)\n",
-        //                uncomp->head, uncomp->tail, uncomp->head == uncomp->tail);
-        //     }
-        //     //usleep(10);
-        // } else {
-        //     no_data_counter = 0;  // Reset counter when we send something
-        // }
+
+        if (!sent_something) {
+            no_data_counter++;
+            if (no_data_counter % 100000000 == 0) { 
+                printf("Network: No data to send (count: %lu)\n", no_data_counter);
+            }
+            //usleep(10);
+        } else {
+            no_data_counter = 0; 
+        }
     }
     
     printf("Network sender thread exiting\n");
@@ -918,14 +858,13 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    //ring->socket_fd = -1;  // Disabled for demo
     ring->socket_fd = setup_server_socket(port);
     if (ring->socket_fd < 0) {
         printf("Warning: Failed to setup socket, continuing without network\n");
         ring->socket_fd = -1;
     }
     
-    pthread_t producer_tid, consumer_tid, sender_tid;
+    pthread_t producer_tid, consumer_tid, sender_tid, polling_tid;
     
     if (pthread_create(&producer_tid, NULL, producer_thread, ring) != 0) {
         printf("Failed to create producer thread\n");
@@ -949,9 +888,10 @@ int main(int argc, char *argv[])
         ring_buffer_cleanup(ring);
         return 1; 
     }
+
     
     printf("Pipeline running... Press Ctrl+C to stop\n");
-    sleep(45);  
+    sleep(30);  
     
     printf("\nShutting down...\n");
     ring->running = false;
@@ -974,10 +914,6 @@ int main(int argc, char *argv[])
     }
 
     for (int i = 0; i < SEND_QUEUE_SIZE; i++) {
-        free(ring->compressed_send_queue.entries[i].data);
-        if (ring->compressed_send_queue.entries[i].header) {
-            free(ring->compressed_send_queue.entries[i].header);
-        }
         free(ring->uncompressed_send_queue.entries[i].data);
     }
 
