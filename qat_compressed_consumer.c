@@ -16,7 +16,7 @@
 typedef struct {
     uint32_t magic;
     uint32_t uncompressed_size;
-    uint32_t compressed_size;
+uint32_t compressed_size;
     uint64_t sequence_number;
     uint8_t algorithm;
     uint8_t compression_level;

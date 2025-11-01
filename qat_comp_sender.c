@@ -20,11 +20,12 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 
-#define RING_SIZE 8 * 1024
+#define TEST_DATA_SIZE 64 * 1024    
+#define RING_SIZE 10 * 1024
 #define CACHE_LINE_SIZE 64
-#define MAX_BUFFER_SIZE 65536
+#define MAX_BUFFER_SIZE 128 * 1024  
 #define SAMPLE_SIZE 256
-#define SEND_QUEUE_SIZE 16384        
+#define SEND_QUEUE_SIZE 8 * 1024    
 
 typedef enum {
     JOB_EMPTY = 0,
@@ -399,7 +400,7 @@ void* producer_thread(void *arg)
     uint64_t ring_full_count = 0;
     uint64_t queue_full_count = 0;
     
-    char test_data[4096];
+    char test_data[64 * 1024];
     memset(test_data, 'A', sizeof(test_data));
     
     printf("Producer thread started\n");
@@ -494,7 +495,7 @@ void* producer_thread(void *arg)
                 usleep(10);
                 continue;  
             }
-            
+            queue_full_count = 0;
             uncompressed_send_entry_t *entry = &queue->entries[tail];
             memcpy(entry->data, test_data, sizeof(test_data));
             entry->length = sizeof(test_data);
@@ -518,11 +519,16 @@ void* consumer_thread(void *arg)
     uint64_t send_count = 0;
     uint64_t stuck_count = 0;
     uint64_t compressed_full = 0;
+    uint64_t poll_count = 0;
     
     printf("Consumer thread started\n");
     
     while (ring->running) {
+        poll_count++;
         icp_sal_DcPollInstance(ring->dcInstance, 64);
+        if(poll_count % 1000000 == 0) {
+            printf("Consumer: Polled %lu times...\n", poll_count);
+        }
         
         uint32_t current_head = ring->consumer.head;
         ring_entry_t *entry = &ring->entries[current_head];
@@ -633,7 +639,7 @@ void* network_sender_thread(void *arg)
                 } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     __sync_fetch_and_add(&ring->socket_blocked_count, 1);
                     usleep(10);
-                    break;  
+                    continue;  
                 } else {
                     perror("compressed send failed");
                     entry->status = JOB_EMPTY;
@@ -669,7 +675,7 @@ void* network_sender_thread(void *arg)
                     } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         __sync_fetch_and_add(&ring->socket_blocked_count, 1);
                         usleep(10);
-                        break;
+                        continue;
                     } else {
                         perror("uncompressed send failed");
                         uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
