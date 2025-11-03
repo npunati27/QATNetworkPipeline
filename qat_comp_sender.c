@@ -590,7 +590,7 @@ void* network_sender_thread(void *arg)
     uint64_t sent_entries = 0;
     uint64_t no_data_counter = 0;
     
-    printf("Network sender thread started\n");
+    printf("Network sender thread started...\n");
     
     while (ring->running) {
         bool sent_something = false;
@@ -826,7 +826,9 @@ void print_qat_stats(ring_buffer_t *ring)
                                     ring->qat_stats.first_submit_time.tv_nsec) / 1e9;
                
         double mb_processed = (double)ring->qat_stats.total_bytes_in / (1024 * 1024);
+        double mb_bytes_out = (double)ring->qat_stats.total_bytes_out / (1024 * 1024);
         double throughput_mbps = mb_processed / elapsed_sec;
+        double output_throughput = mb_bytes_out / elapsed_sec;
         double ops_per_sec = ring->qat_stats.total_compressions / elapsed_sec;
         
         printf("QAT Performance Stats:\n");
@@ -835,6 +837,7 @@ void print_qat_stats(ring_buffer_t *ring)
         printf("  Compression ratio: %.2f%%\n", compression_ratio * 100);
         printf("  Operations per second: %.0f\n", ops_per_sec);
         printf("  Throughput: %.2f MB/s\n", throughput_mbps);
+        printf("  Output Throughput: %.2f MB/s\n", output_throughput);
     }
 }
 

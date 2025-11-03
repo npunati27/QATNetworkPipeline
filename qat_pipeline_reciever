@@ -1,0 +1,502 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <stdint.h>
+#include <qat/cpa.h>
+#include <qat/cpa_dc.h>
+#include <qat/icp_sal_user.h>
+#include <qat/icp_sal_poll.h>
+#include <qat/qae_mem.h>
+
+#define MAGIC_NUMBER 0x51415443
+#define MAX_BUFFER_SIZE 131072
+#define QUEUE_SIZE 16384
+
+// Compression header
+typedef struct {
+    uint32_t magic;
+    uint32_t uncompressed_size;
+    uint32_t compressed_size;
+    uint64_t sequence_number;
+    uint8_t algorithm;
+    uint8_t compression_level;
+    uint16_t checksum;
+} __attribute__((packed)) compression_header_t;
+
+// Packet in the queue
+typedef struct {
+    compression_header_t header;
+    uint8_t *compressed_data;
+    size_t data_size;
+    bool is_compressed;
+} queued_packet_t;
+
+// Ring buffer for packets
+typedef struct {
+    queued_packet_t packets[QUEUE_SIZE];
+    volatile uint32_t head;  // Consumer reads from head
+    volatile uint32_t tail;  // Producer writes to tail
+    uint32_t mask;
+    volatile bool running;
+} packet_queue_t;
+
+// Statistics
+typedef struct {
+    volatile uint64_t packets_received;
+    volatile uint64_t bytes_received;
+    volatile uint64_t compressed_packets;
+    volatile uint64_t uncompressed_packets;
+    volatile uint64_t decompressed_packets;
+    volatile uint64_t decompress_errors;
+    volatile uint64_t queue_full_count;
+    struct timeval start_time;
+} stats_t;
+
+// QAT context
+typedef struct {
+    CpaInstanceHandle dcInstance;
+    CpaDcSessionHandle sessionHandle;
+    void *sessionMemory;
+} qat_ctx_t;
+
+// Global state
+packet_queue_t g_queue;
+stats_t g_stats = {0};
+qat_ctx_t g_qat_ctx = {0};
+
+// Initialize packet queue
+void queue_init(packet_queue_t *queue)
+{
+    memset(queue, 0, sizeof(packet_queue_t));
+    queue->mask = QUEUE_SIZE - 1;
+    queue->running = true;
+    
+    // Pre-allocate buffers for all queue slots
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        queue->packets[i].compressed_data = malloc(MAX_BUFFER_SIZE);
+    }
+}
+
+// Try to enqueue a packet (non-blocking)
+bool queue_push(packet_queue_t *queue, compression_header_t *header, 
+                uint8_t *data, size_t size, bool is_compressed)
+{
+    uint32_t current_tail = queue->tail;
+    uint32_t next_tail = (current_tail + 1) & queue->mask;
+    
+    if (next_tail == queue->head) {
+        __sync_fetch_and_add(&g_stats.queue_full_count, 1);
+        return false;  // Queue full
+    }
+    
+    queued_packet_t *pkt = &queue->packets[current_tail];
+    
+    if (is_compressed) {
+        pkt->header = *header;
+        memcpy(pkt->compressed_data, data, size);
+        pkt->data_size = size;
+        pkt->is_compressed = true;
+    } else {
+        pkt->is_compressed = false;
+        pkt->data_size = size;
+    }
+    
+    __sync_synchronize();
+    queue->tail = next_tail;
+    
+    return true;
+}
+
+// Dequeue a packet (non-blocking)
+bool queue_pop(packet_queue_t *queue, queued_packet_t *out_pkt)
+{
+    uint32_t current_head = queue->head;
+    
+    if (current_head == queue->tail) {
+        return false;  // Queue empty
+    }
+    
+    queued_packet_t *pkt = &queue->packets[current_head];
+    *out_pkt = *pkt;  // Copy packet data
+    
+    __sync_synchronize();
+    queue->head = (current_head + 1) & queue->mask;
+    
+    return true;
+}
+
+// Initialize QAT
+int qat_init(qat_ctx_t *ctx, int compression_level)
+{
+    CpaStatus status;
+    Cpa16U numInstances = 0;
+    CpaInstanceHandle *instances = NULL;
+    CpaDcSessionSetupData sessionSetupData = {0};
+    Cpa32U sessionSize = 0;
+    Cpa32U contextSize = 0;
+    
+    status = icp_sal_userStartMultiProcess("SSL", CPA_FALSE);
+    if (status != CPA_STATUS_SUCCESS) {
+        printf("Failed to start QAT: %d\n", status);
+        return -1;
+    }
+    
+    status = cpaDcGetNumInstances(&numInstances);
+    if (status != CPA_STATUS_SUCCESS || numInstances == 0) {
+        printf("No QAT instances available\n");
+        return -1;
+    }
+    
+    instances = malloc(numInstances * sizeof(CpaInstanceHandle));
+    status = cpaDcGetInstances(numInstances, instances);
+    if (status != CPA_STATUS_SUCCESS) {
+        free(instances);
+        return -1;
+    }
+    
+    ctx->dcInstance = instances[0];
+    free(instances);
+    
+    status = cpaDcSetAddressTranslation(ctx->dcInstance, qaeVirtToPhysNUMA);
+    if (status != CPA_STATUS_SUCCESS) {
+        printf("Failed to set address translation\n");
+        return -1;
+    }
+    
+    status = cpaDcStartInstance(ctx->dcInstance, 512, NULL);
+    if (status != CPA_STATUS_SUCCESS) {
+        printf("Failed to start instance\n");
+        return -1;
+    }
+    
+    CpaDcCompLvl qat_level = CPA_DC_L1;
+    switch(compression_level) {
+        case 1: qat_level = CPA_DC_L1; break;
+        case 2: qat_level = CPA_DC_L2; break;
+        case 3: qat_level = CPA_DC_L3; break;
+        case 4: qat_level = CPA_DC_L4; break;
+        case 5: qat_level = CPA_DC_L5; break;
+        case 6: qat_level = CPA_DC_L6; break;
+        case 7: qat_level = CPA_DC_L7; break;
+        case 8: qat_level = CPA_DC_L8; break;
+        case 9: qat_level = CPA_DC_L9; break;
+    }
+    
+    sessionSetupData.compLevel = qat_level;
+    sessionSetupData.compType = CPA_DC_DEFLATE;
+    sessionSetupData.huffType = CPA_DC_HT_STATIC;
+    sessionSetupData.sessDirection = CPA_DC_DIR_DECOMPRESS;
+    sessionSetupData.sessState = CPA_DC_STATELESS;
+    sessionSetupData.checksum = CPA_DC_CRC32;
+    
+    status = cpaDcGetSessionSize(ctx->dcInstance, &sessionSetupData,
+                                 &sessionSize, &contextSize);
+    if (status != CPA_STATUS_SUCCESS) {
+        return -1;
+    }
+    
+    ctx->sessionMemory = qaeMemAllocNUMA(sessionSize, 0, 64);
+    if (!ctx->sessionMemory) {
+        return -1;
+    }
+    
+    ctx->sessionHandle = ctx->sessionMemory;
+    status = cpaDcInitSession(ctx->dcInstance, ctx->sessionHandle,
+                             &sessionSetupData, NULL, NULL);
+    if (status != CPA_STATUS_SUCCESS) {
+        qaeMemFreeNUMA(&ctx->sessionMemory);
+        return -1;
+    }
+    
+    printf("QAT initialized successfully\n");
+    return 0;
+}
+
+// Receive exact number of bytes
+int recv_exact(int sockfd, void *buffer, size_t len)
+{
+    size_t total = 0;
+    while (total < len) {
+        ssize_t n = recv(sockfd, (char*)buffer + total, len - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return 0;
+}
+
+// Network receiver thread - just receive and queue
+void* network_thread(void *arg)
+{
+    int sockfd = *(int*)arg;
+    uint8_t temp_buffer[MAX_BUFFER_SIZE];
+    
+    printf("Network thread started\n");
+    
+    while (g_queue.running) {
+        // Peek at magic number
+        uint32_t magic;
+        ssize_t n = recv(sockfd, &magic, sizeof(uint32_t), MSG_PEEK);
+        if (n != sizeof(uint32_t)) break;
+        
+        if (magic == MAGIC_NUMBER) {
+            // Compressed packet
+            compression_header_t header;
+            if (recv_exact(sockfd, &header, sizeof(header)) < 0) break;
+            
+            if (recv_exact(sockfd, temp_buffer, header.compressed_size) < 0) break;
+            
+            __sync_fetch_and_add(&g_stats.packets_received, 1);
+            __sync_fetch_and_add(&g_stats.bytes_received, sizeof(header) + header.compressed_size);
+            __sync_fetch_and_add(&g_stats.compressed_packets, 1);
+            
+            // Try to queue (non-blocking)
+            if (!queue_push(&g_queue, &header, temp_buffer, header.compressed_size, true)) {
+                // Queue full - drop packet (or could block here)
+                // For throughput test, dropping is fine
+            }
+            
+        } else {
+            // Uncompressed packet
+            ssize_t n = recv(sockfd, temp_buffer, sizeof(temp_buffer), 0);
+            if (n <= 0) break;
+            
+            __sync_fetch_and_add(&g_stats.packets_received, 1);
+            __sync_fetch_and_add(&g_stats.bytes_received, n);
+            __sync_fetch_and_add(&g_stats.uncompressed_packets, 1);
+            
+            // Queue uncompressed (or just discard for throughput test)
+            // For now, just count it
+        }
+    }
+    
+    printf("Network thread exiting\n");
+    return NULL;
+}
+
+// Decompression worker thread
+void* decompress_thread(void *arg)
+{
+    qat_ctx_t *ctx = (qat_ctx_t*)arg;
+    queued_packet_t pkt;
+    
+    // Allocate QAT buffers once
+    CpaBufferList *pSrcBuffer = qaeMemAllocNUMA(sizeof(CpaBufferList), 0, 64);
+    CpaBufferList *pDstBuffer = qaeMemAllocNUMA(sizeof(CpaBufferList), 0, 64);
+    CpaFlatBuffer *pFlatSrc = qaeMemAllocNUMA(sizeof(CpaFlatBuffer), 0, 64);
+    CpaFlatBuffer *pFlatDst = qaeMemAllocNUMA(sizeof(CpaFlatBuffer), 0, 64);
+    Cpa8U *dstData = qaeMemAllocNUMA(MAX_BUFFER_SIZE, 0, 64);
+    
+    Cpa32U metaSize = 0;
+    cpaDcBufferListGetMetaSize(ctx->dcInstance, 1, &metaSize);
+    Cpa8U *srcMetaData = NULL;
+    Cpa8U *dstMetaData = NULL;
+    if (metaSize > 0) {
+        srcMetaData = qaeMemAllocNUMA(metaSize, 0, 64);
+        dstMetaData = qaeMemAllocNUMA(metaSize, 0, 64);
+    }
+    
+    printf("Decompression thread started\n");
+    
+    while (g_queue.running) {
+        if (!queue_pop(&g_queue, &pkt)) {
+            // Queue empty - wait a bit
+            usleep(10);
+            continue;
+        }
+        
+        if (!pkt.is_compressed) {
+            // Uncompressed packet - just count it
+            continue;
+        }
+        
+        // Decompress using QAT
+        pFlatSrc->pData = pkt.compressed_data;
+        pFlatSrc->dataLenInBytes = pkt.data_size;
+        pSrcBuffer->pBuffers = pFlatSrc;
+        pSrcBuffer->numBuffers = 1;
+        pSrcBuffer->pPrivateMetaData = srcMetaData;
+        
+        pFlatDst->pData = dstData;
+        pFlatDst->dataLenInBytes = MAX_BUFFER_SIZE;
+        pDstBuffer->pBuffers = pFlatDst;
+        pDstBuffer->numBuffers = 1;
+        pDstBuffer->pPrivateMetaData = dstMetaData;
+        
+        CpaDcRqResults dcResults = {0};
+        
+        // Synchronous decompress - blocks until complete
+        CpaStatus status = cpaDcDecompressData(ctx->dcInstance, ctx->sessionHandle,
+                                               pSrcBuffer, pDstBuffer,
+                                               &dcResults, CPA_DC_FLUSH_FINAL);
+        
+        if (status == CPA_STATUS_SUCCESS) {
+            __sync_fetch_and_add(&g_stats.decompressed_packets, 1);
+        } else {
+            __sync_fetch_and_add(&g_stats.decompress_errors, 1);
+        }
+    }
+    
+    // Cleanup
+    qaeMemFreeNUMA((void**)&dstData);
+    qaeMemFreeNUMA((void**)&pFlatSrc);
+    qaeMemFreeNUMA((void**)&pFlatDst);
+    if (srcMetaData) qaeMemFreeNUMA((void**)&srcMetaData);
+    if (dstMetaData) qaeMemFreeNUMA((void**)&dstMetaData);
+    qaeMemFreeNUMA((void**)&pSrcBuffer);
+    qaeMemFreeNUMA((void**)&pDstBuffer);
+    
+    printf("Decompression thread exiting\n");
+    return NULL;
+}
+
+// Stats reporter thread
+void* stats_thread(void *arg)
+{
+    uint64_t last_packets = 0;
+    uint64_t last_bytes = 0;
+    time_t last_time = time(NULL);
+    
+    while (g_queue.running) {
+        sleep(5);
+        
+        time_t now = time(NULL);
+        uint64_t current_packets = g_stats.packets_received;
+        uint64_t current_bytes = g_stats.bytes_received;
+        
+        uint64_t pkt_delta = current_packets - last_packets;
+        uint64_t byte_delta = current_bytes - last_bytes;
+        double elapsed = now - last_time;
+        
+        double mbps = (byte_delta * 8.0) / (elapsed * 1000000.0);
+        double pps = pkt_delta / elapsed;
+        
+        uint32_t queue_depth = (g_queue.tail - g_queue.head) & g_queue.mask;
+        
+        printf("Throughput: %.2f Mbps (%.2f MB/s) | Packets: %.0f/sec | "
+               "Queue: %u | Decompressed: %lu | Errors: %lu | QueueFull: %lu\n",
+               mbps, byte_delta / (elapsed * 1024 * 1024), pps,
+               queue_depth, g_stats.decompressed_packets, 
+               g_stats.decompress_errors, g_stats.queue_full_count);
+        
+        last_packets = current_packets;
+        last_bytes = current_bytes;
+        last_time = now;
+    }
+    
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    const char *host = "127.0.0.1";
+    int port = 9999;
+    int compression_level = 1;
+    int num_decompress_threads = 4;  // Multiple decompression workers
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
+            compression_level = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) {
+            host = argv[++i];
+        } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            num_decompress_threads = atoi(argv[++i]);
+        }
+    }
+    
+    printf("=== Pipelined QAT Receiver ===\n");
+    printf("Decompression threads: %d\n\n", num_decompress_threads);
+    
+    // Initialize queue
+    queue_init(&g_queue);
+    
+    // Initialize QAT
+    if (qat_init(&g_qat_ctx, compression_level) < 0) {
+        return 1;
+    }
+    
+    // Connect to server
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        return 1;
+    }
+    
+    // Set large receive buffer
+    int rcvbuf = 64 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    inet_pton(AF_INET, host, &server_addr.sin_addr);
+    
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        return 1;
+    }
+    
+    printf("Connected to %s:%d\n\n", host, port);
+    
+    gettimeofday(&g_stats.start_time, NULL);
+    
+    // Start threads
+    pthread_t net_tid, stats_tid;
+    pthread_t *decomp_tids = malloc(num_decompress_threads * sizeof(pthread_t));
+    
+    pthread_create(&net_tid, NULL, network_thread, &sockfd);
+    pthread_create(&stats_tid, NULL, stats_thread, NULL);
+    
+    for (int i = 0; i < num_decompress_threads; i++) {
+        pthread_create(&decomp_tids[i], NULL, decompress_thread, &g_qat_ctx);
+    }
+    
+    // Wait for network thread (will exit when connection closes)
+    pthread_join(net_tid, NULL);
+    
+    g_queue.running = false;
+    
+    // Wait for other threads
+    pthread_join(stats_tid, NULL);
+    for (int i = 0; i < num_decompress_threads; i++) {
+        pthread_join(decomp_tids[i], NULL);
+    }
+    
+    // Final stats
+    struct timeval end_time;
+    gettimeofday(&end_time, NULL);
+    double elapsed = (end_time.tv_sec - g_stats.start_time.tv_sec) +
+                     (end_time.tv_usec - g_stats.start_time.tv_usec) / 1e6;
+    
+    printf("\n=== FINAL STATISTICS ===\n");
+    printf("Duration: %.2f seconds\n", elapsed);
+    printf("Total packets: %lu\n", g_stats.packets_received);
+    printf("  Compressed: %lu\n", g_stats.compressed_packets);
+    printf("  Uncompressed: %lu\n", g_stats.uncompressed_packets);
+    printf("Total bytes: %.2f MB\n", g_stats.bytes_received / (1024.0 * 1024.0));
+    printf("Decompressed: %lu\n", g_stats.decompressed_packets);
+    printf("Errors: %lu\n", g_stats.decompress_errors);
+    printf("Avg throughput: %.2f Mbps\n", 
+           (g_stats.bytes_received * 8.0) / (elapsed * 1000000.0));
+    
+    // Cleanup
+    close(sockfd);
+    cpaDcRemoveSession(g_qat_ctx.dcInstance, g_qat_ctx.sessionHandle);
+    qaeMemFreeNUMA(&g_qat_ctx.sessionMemory);
+    cpaDcStopInstance(g_qat_ctx.dcInstance);
+    icp_sal_userStop();
+    
+    for (int i = 0; i < QUEUE_SIZE; i++) {
+        free(g_queue.packets[i].compressed_data);
+    }
+    free(decomp_tids);
+    
+    return 0;
+}
