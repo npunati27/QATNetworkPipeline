@@ -50,11 +50,11 @@ typedef struct {
 
 typedef struct {
     volatile uint64_t packets_received;
-    volatile uint64_t bytes_received;              // Wire bytes (compressed)
+    volatile uint64_t bytes_received;              
     volatile uint64_t compressed_packets;
     volatile uint64_t uncompressed_packets;
     volatile uint64_t decompressed_packets;
-    volatile uint64_t decompressed_bytes;          // Actual decompressed data
+    volatile uint64_t decompressed_bytes;          
     volatile uint64_t decompress_errors;
     volatile uint64_t queue_full_count;
     struct timeval start_time;
