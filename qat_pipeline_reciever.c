@@ -401,7 +401,7 @@ void* stats_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    const char *host = "127.0.0.1";
+    const char *host = "192.168.100.3";
     int port = 9999;
     int num_workers = 4;
     
@@ -427,7 +427,7 @@ int main(int argc, char *argv[])
         perror("socket");
         return 1;
     }
-    
+
     int rcvbuf = 64 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     
