@@ -1,0 +1,47 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+
+# Executables
+qat_sender
+pipeline_receiver
+fast_receiver
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+*.bak
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# QAT specific
+*.qat
+
+# Backup files
+*~
+*.orig
