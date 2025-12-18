@@ -56,7 +56,7 @@ int connect_to_server(const char *host, int port)
 
 int main(int argc, char *argv[])
 {
-    const char *host = "127.0.0.1";
+    const char *host = "192.168.100.1";
     int port = 9999;
     int sockfd;
     stats_t stats = {0};

@@ -401,7 +401,7 @@ void* stats_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-    const char *host = "192.168.100.3";
+    const char *host = "192.168.100.1";
     int port = 9999;
     int num_workers = 4;
     

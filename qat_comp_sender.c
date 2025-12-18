@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <sched.h>
 #include <qat/cpa.h>              
 #include <qat/cpa_dc.h>           
 #include <qat/icp_sal_user.h>     
@@ -19,13 +21,19 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <stdlib.h>
+#include <time.h>
 
 #define TEST_DATA_SIZE 64 * 1024    
 #define RING_SIZE 10 * 1024
 #define CACHE_LINE_SIZE 64
 #define MAX_BUFFER_SIZE 128 * 1024  
 #define SAMPLE_SIZE 256
-#define SEND_QUEUE_SIZE 8 * 1024    
+#define SEND_QUEUE_SIZE 36 * 1024   
+#define NUM_PRODUCERS 1
+#define NUM_CONSUMERS 1
+#define NUM_SENDERS 1
+
 
 typedef enum {
     JOB_EMPTY = 0,
@@ -141,7 +149,30 @@ typedef struct {
 
 } ring_buffer_t;
 
+typedef struct {
+    ring_buffer_t *ring;
+    int thread_id;
+    int core_id;
+} thread_args_t;
+
 static ring_buffer_t *g_ring = NULL;
+
+int pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    
+    pthread_t current_thread = pthread_self();
+    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    
+    if (result == 0) {
+        printf("Thread pinned to core %d\n", core_id);
+    } else {
+        fprintf(stderr, "Failed to pin thread to core %d: %s\n", core_id, strerror(result));
+    }
+    
+    return result;
+}
 
 void qat_dc_callback(void *pCallbackTag, CpaStatus status)
 {
@@ -208,8 +239,32 @@ int qat_init(ring_buffer_t *ring)
         free(instances);
         return -1;
     }
+
+    int target_numa_node = 2;  //nic location
+    int selected_instance = -1;
+
+    for (int i = 0; i < numInstances; i++) {
+        CpaInstanceInfo2 info;
+        status = cpaDcInstanceGetInfo2(instances[i], &info);
+        
+        if (status == CPA_STATUS_SUCCESS) {
+            printf("Instance %d: nodeAffinity = %d\n", i, info.nodeAffinity);
+            
+            if (info.nodeAffinity == target_numa_node && selected_instance == -1) {
+                selected_instance = i;
+            }
+        }
+    }
+
+    if (selected_instance == -1) {
+        printf("Warning: No QAT on NUMA %d, using instance 0\n", target_numa_node);
+        selected_instance = 0;
+    } else {
+        printf("Selected QAT instance %d on NUMA node %d\n", 
+               selected_instance, target_numa_node);
+    }
     
-    ring->dcInstance = instances[0];
+    ring->dcInstance = instances[selected_instance];
     free(instances);
 
 
@@ -393,21 +448,27 @@ ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction
 
 void* producer_thread(void *arg)
 {
-    ring_buffer_t *ring = (ring_buffer_t *)arg;
+    thread_args_t* args = (thread_args_t*) arg;
+    ring_buffer_t *ring = args->ring;
+    int thread_id = args->thread_id;
+    pin_thread_to_core(args->core_id);
+    printf("Producer thread %d started on core %d\n", thread_id, args->core_id);
+
     CpaStatus status;
-    uint64_t sequence = 0;
     uint64_t retry_count = 0;
     uint64_t ring_full_count = 0;
     uint64_t queue_full_count = 0;
+
+    uint64_t bytes_generated = 0;
+    uint64_t packets_generated = 0;
+    time_t last_report = time(NULL);
     
     char test_data[64 * 1024];
     memset(test_data, 'A', sizeof(test_data));
     
-    printf("Producer thread started\n");
-    
     while (ring->running) {
         float rand_val = (float)rand() / RAND_MAX;
-        bool use_compressed = (rand_val < ring->compressed_fraction);
+        bool use_compressed = (rand_val < ring->compressed_fraction); 
         
         if (use_compressed) {
             uint32_t current_tail = ring->producer.tail;
@@ -419,7 +480,7 @@ void* producer_thread(void *arg)
                     printf("Producer: Ring buffer full (count: %lu)\n", ring_full_count);
                 }
                 //usleep(10);
-                continue;  // Retry
+                continue;  // retry
             }            
             ring_entry_t *entry = &ring->entries[current_tail];
             if(entry->status != JOB_EMPTY) {
@@ -433,11 +494,14 @@ void* producer_thread(void *arg)
             ring_full_count = 0;
             
             if (!ring->running) break;
+            bytes_generated += sizeof(test_data);
+            packets_generated++; 
             
             memcpy(entry->pSrcData, test_data, sizeof(test_data));
             entry->srcDataSize = sizeof(test_data);
             entry->pFlatSrcBuffer->dataLenInBytes = sizeof(test_data);
             
+            //allows receiver to uncompress
             entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
             entry->header.magic = 0x51415443;
             entry->header.sequence_number = entry->sequence_number;
@@ -463,13 +527,14 @@ void* producer_thread(void *arg)
                     clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
                     __sync_synchronize();
                     ring->qat_stats.timing_started = true;
-                }    
+                }  
                 __sync_synchronize();
                 entry->status = JOB_SUBMITTED;
                 ring->producer.tail = next_tail;
                 ring->producer.jobs_submitted++;
                 retry_count = 0;  
             } else if (status == CPA_STATUS_RETRY) {
+                //QAT backpressure here
                 retry_count++;
                 if (retry_count % 1000 == 0) {
                     printf("Producer: QAT retry count: %lu\n", retry_count);
@@ -492,7 +557,6 @@ void* producer_thread(void *arg)
                 if (queue_full_count % 10000 == 0) {
                     printf("Producer: Uncompressed queue full (count: %lu)\n", queue_full_count);
                 }
-                usleep(10);
                 continue;  
             }
             queue_full_count = 0;
@@ -503,7 +567,22 @@ void* producer_thread(void *arg)
             
             __sync_synchronize();
             queue->tail = next_tail;
-            ring->producer.jobs_submitted++;   
+            ring->producer.jobs_submitted++;
+            
+        }
+
+        time_t now = time(NULL);
+        if (now - last_report >= 5) {
+            double elapsed = (double)(now - last_report);
+            double mbps = (bytes_generated / elapsed) / (1024.0 * 1024.0);
+            double pps = packets_generated / elapsed;
+            
+            printf("Producer %d: %.2f MB/s, %.0f packets/s (generated)\n", 
+                thread_id, mbps, pps);
+            
+            bytes_generated = 0;
+            packets_generated = 0;
+            last_report = now;
         }
         
         //usleep(10); 
@@ -513,22 +592,26 @@ void* producer_thread(void *arg)
     return NULL;
 }
 
+
 void* consumer_thread(void *arg)
 {
-    ring_buffer_t *ring = (ring_buffer_t *)arg;
+    thread_args_t* args = (thread_args_t*)arg;
+    ring_buffer_t *ring = args->ring;
+    int thread_id = args->thread_id;
+    pin_thread_to_core(args->core_id);
+    printf("Consumer thread %d started on core %d\n", thread_id, args->core_id);
+
     uint64_t send_count = 0;
     uint64_t stuck_count = 0;
     uint64_t compressed_full = 0;
     uint64_t poll_count = 0;
-    
-    printf("Consumer thread started\n");
-    
+        
     while (ring->running) {
         poll_count++;
         icp_sal_DcPollInstance(ring->dcInstance, 64);
-        if(poll_count % 1000000 == 0) {
-            printf("Consumer: Polled %lu times...\n", poll_count);
-        }
+        // if(poll_count % 1000000 == 0) {
+        //     printf("Consumer: Polled %lu times...\n", poll_count);
+        // }
         
         uint32_t current_head = ring->consumer.head;
         ring_entry_t *entry = &ring->entries[current_head];
@@ -584,14 +667,21 @@ void* consumer_thread(void *arg)
 
 void* network_sender_thread(void *arg)
 {
-    ring_buffer_t *ring = (ring_buffer_t *)arg;
+    thread_args_t* args = (thread_args_t*) arg;
+    ring_buffer_t *ring = args->ring;
+    pin_thread_to_core(args->core_id);
+    printf("Network sender thread started on core %d\n", args->core_id);
+
+
     uint64_t last_packets_sent = 0;
     time_t last_report_time = time(NULL);
     uint64_t sent_entries = 0;
     uint64_t no_data_counter = 0;
-    
-    printf("Network sender thread started...\n");
-    
+
+    // uint64_t uncomp_bytes_attempted = 0;
+    // uint64_t uncomp_packets_attempted = 0;
+    // time_t last_uncomp_report = time(NULL);
+        
     while (ring->running) {
         bool sent_something = false;
         time_t now = time(NULL);
@@ -662,7 +752,7 @@ void* network_sender_thread(void *arg)
             uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
             while (uncomp_queue->head != uncomp_queue->tail) {
                 uncompressed_send_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
-                
+                    
                 if (ring->socket_fd > 0) {
                     ssize_t sent = send(ring->socket_fd, entry->data, 
                                        entry->length, MSG_DONTWAIT);
@@ -754,6 +844,7 @@ void ring_buffer_cleanup(ring_buffer_t *ring)
     free(ring);
 }
 
+
 int setup_server_socket(int port)
 {
     int sockfd;
@@ -775,9 +866,9 @@ int setup_server_socket(int port)
     
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    // server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, "192.168.101.2", &server_addr.sin_addr);
+    // inet_pton(AF_INET, "192.168.101.2", &server_addr.sin_addr);
     
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
@@ -806,6 +897,27 @@ int setup_server_socket(int port)
     printf("Client connected from %s:%d\n",
            inet_ntoa(client_addr.sin_addr),
            ntohs(client_addr.sin_port));
+
+    int sndbuf = 1024 * 1024 * 1024;  // 1 GB
+    int rcvbuf = 1024 * 1024 * 1024;  // 1 GB
+    
+    int ret = setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    if (ret < 0) {
+        perror("ERROR: setsockopt SO_SNDBUF failed");
+    }
+    
+    ret = setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (ret < 0) {
+        perror("ERROR: setsockopt SO_RCVBUF failed");
+    }
+    
+    socklen_t optlen = sizeof(sndbuf);
+    getsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen);
+    getsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen);
+    
+    printf("Actual socket buffers: send=%d bytes (%.2f MB), recv=%d bytes (%.2f MB)\n", 
+            sndbuf, sndbuf/(1024.0*1024.0), 
+            rcvbuf, rcvbuf/(1024.0*1024.0));
     
     int flags = fcntl(client_fd, F_GETFL, 0);
     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
@@ -813,6 +925,8 @@ int setup_server_socket(int port)
     close(sockfd); 
     return client_fd;
 }
+
+
 
 void print_qat_stats(ring_buffer_t *ring)
 {
@@ -847,6 +961,7 @@ int main(int argc, char *argv[])
     int compression_level = 1;
     float compressed_fraction = 0.5; 
     int port = 9999; 
+    int numa_node2_base = 64;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
@@ -874,41 +989,70 @@ int main(int argc, char *argv[])
         ring->socket_fd = -1;
     }
     
-    pthread_t producer_tid, consumer_tid, sender_tid, polling_tid;
-    
-    if (pthread_create(&producer_tid, NULL, producer_thread, ring) != 0) {
-        printf("Failed to create producer thread\n");
-        ring_buffer_cleanup(ring);
-        return 1;
-    }
-    
-    if (pthread_create(&consumer_tid, NULL, consumer_thread, ring) != 0) {
-        printf("Failed to create consumer thread\n");
-        ring->running = false;
-        pthread_join(producer_tid, NULL);
-        ring_buffer_cleanup(ring);
-        return 1;
+    pthread_t producer_tids[NUM_PRODUCERS];
+    pthread_t consumer_tids[NUM_CONSUMERS];
+    pthread_t sender_tids[NUM_SENDERS];
+
+    for (int i = 0; i < NUM_PRODUCERS; i++) {
+        thread_args_t *args = malloc(sizeof(thread_args_t));
+        args->ring = ring;
+        args->thread_id = i;
+        args->core_id = numa_node2_base + i; 
+        
+        if (pthread_create(&producer_tids[i], NULL, producer_thread, args) != 0) {
+            printf("Failed to create producer thread %d\n", i);
+            ring->running = false;
+            return 1;
+        }
     }
 
-    if(pthread_create(&sender_tid, NULL, network_sender_thread, ring) != 0) {
-        printf("Failed to create sender thread\n");
-        ring->running = false; 
-        pthread_join(producer_tid, NULL);
-        pthread_join(consumer_tid, NULL);
-        ring_buffer_cleanup(ring);
-        return 1; 
+    for (int i = 0; i < NUM_CONSUMERS; i++) {
+        thread_args_t *args = malloc(sizeof(thread_args_t));
+        args->ring = ring;
+        args->thread_id = i;
+        args->core_id = numa_node2_base + NUM_PRODUCERS + i;  
+        
+        if (pthread_create(&consumer_tids[i], NULL, consumer_thread, args) != 0) {
+            printf("Failed to create consumer thread %d\n", i);
+            ring->running = false;
+            return 1;
+        }
     }
 
-    
-    printf("Pipeline running... Press Ctrl+C to stop\n");
+    for (int i = 0; i < NUM_SENDERS; i++) {
+        thread_args_t *args = malloc(sizeof(thread_args_t));
+        args->ring = ring;
+        args->thread_id = i;
+        args->core_id = numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + i;  // Core 70
+        
+        if (pthread_create(&sender_tids[i], NULL, network_sender_thread, args) != 0) {
+            printf("Failed to create sender thread %d\n", i);
+            ring->running = false;
+            return 1;
+        }
+    }
+
+
+    printf("Pipeline running with %d producers, %d consumers, %d senders\n",
+        NUM_PRODUCERS, NUM_CONSUMERS, NUM_SENDERS);
+    printf("All threads pinned to NUMA node 2 (cores %d-%d)\n",
+            numa_node2_base, 
+            numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + NUM_SENDERS - 1);
+
     sleep(30);  
     
     printf("\nShutting down...\n");
     ring->running = false;
     
-    pthread_join(producer_tid, NULL);
-    pthread_join(consumer_tid, NULL);
-    pthread_join(sender_tid, NULL); 
+    for (int i = 0; i < NUM_PRODUCERS; i++) {
+        pthread_join(producer_tids[i], NULL);
+    }
+    for (int i = 0; i < NUM_CONSUMERS; i++) {
+        pthread_join(consumer_tids[i], NULL);
+    }
+    for (int i = 0; i < NUM_SENDERS; i++) {
+        pthread_join(sender_tids[i], NULL);
+    }
     
     printf("\nStatistics:\n");
     printf("  Jobs submitted: %lu\n", ring->producer.jobs_submitted);
