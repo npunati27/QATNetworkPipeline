@@ -401,12 +401,7 @@ void* stats_thread(void *arg)
 
 int main(int argc, char *argv[])
 {
-<<<<<<< Updated upstream:receivers/qat_pipeline_reciever.c
-    const char *host = "192.168.100.1";
-=======
-    //const char *host = "192.168.100.3";
     const char *host = "192.168.100.3";
->>>>>>> Stashed changes:qat_pipeline_reciever.c
     int port = 9999;
     int num_workers = 4;
     
