@@ -23,17 +23,27 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
 
 #define TEST_DATA_SIZE 64 * 1024    
 #define RING_SIZE 10 * 1024
 #define CACHE_LINE_SIZE 64
 #define MAX_BUFFER_SIZE 128 * 1024  
 #define SAMPLE_SIZE 256
-#define SEND_QUEUE_SIZE 36 * 1024   
+#define SEND_QUEUE_SIZE 128 * 1024   //128
 #define NUM_PRODUCERS 1
 #define NUM_CONSUMERS 1
 #define NUM_SENDERS 1
 
+static bool g_debug_enabled = false;
+
+#define DEBUG_PRINT(fmt, ...) \
+    do { if (g_debug_enabled) fprintf(stderr, "[DEBUG] " fmt "", ##__VA_ARGS__); } while (0)
+
+#define INFO_PRINT(fmt, ...) \
+    fprintf(stderr, "[INFO] " fmt "", ##__VA_ARGS__)
 
 typedef enum {
     JOB_EMPTY = 0,
@@ -42,8 +52,18 @@ typedef enum {
     JOB_ERROR = 3
 } job_status_t;
 
+//compression benchmark file reader
 typedef struct {
-    uint32_t magic;
+    char *file_path;
+    FILE *current_file;
+    uint64_t current_file_offset;
+    uint64_t current_file_size;
+    uint64_t file_reopen_count;
+    pthread_mutex_t file_lock;
+} file_reader_t;
+
+typedef struct {
+    uint32_t magic; //helps receiver recognize compressed packets
     uint32_t uncompressed_size;
     uint32_t compressed_size;
     uint64_t sequence_number;
@@ -52,18 +72,29 @@ typedef struct {
     uint16_t checksum;
 } __attribute__((packed)) compression_header_t;
 
+/* Ring Buffer Entry: 
+    * scatterlist for QAT source + destination buffer
+    * flat buffer stores contiguous memory region and has data buffer pointer
+    * compression job results (dcResults)
+*/
 typedef struct {
     volatile job_status_t status;
     uint64_t sequence_number;
     
+    //scatterlist (required for submission) DMA
+    //contains multiple CpaFlatBuffer entries
     CpaBufferList *pSrcBuffer;
     CpaBufferList *pDstBuffer;
+
+    //represents a contiguous memory region
     CpaFlatBuffer *pFlatSrcBuffer;
     CpaFlatBuffer *pFlatDstBuffer;
     
+    //data buffer pointer
     Cpa8U *pSrcData;
     Cpa8U *pDstData;
     
+    //metadata necessary for correctnesns
     Cpa32U srcDataSize;
     Cpa32U dstDataSize;
     Cpa32U producedSize;  
@@ -76,10 +107,12 @@ typedef struct {
     uint64_t complete_time;
 } ring_entry_t;
 
+// compressed send queue entry is a ring entry
 typedef struct {
     ring_entry_t *entry; 
 } compressed_send_entry_t;
 
+//compressed send queue
 typedef struct {
     compressed_send_entry_t entries[SEND_QUEUE_SIZE];
     volatile uint32_t head;
@@ -88,12 +121,14 @@ typedef struct {
     char pad[CACHE_LINE_SIZE];
 } __attribute__((aligned(CACHE_LINE_SIZE))) compressed_send_queue_t;
 
+//uncompressed send entry just has pointer to data
 typedef struct {
     uint8_t *data;        
     size_t length;
     uint64_t sequence_number;
 } uncompressed_send_entry_t;
 
+//uncompressed send queue
 typedef struct {
     uncompressed_send_entry_t entries[SEND_QUEUE_SIZE];
     volatile uint32_t head;
@@ -102,14 +137,24 @@ typedef struct {
     char pad[CACHE_LINE_SIZE];
 } __attribute__((aligned(CACHE_LINE_SIZE))) uncompressed_send_queue_t;
 
+/* Ring Buffer: 
+    * Ring Buffer Entries
+    * File Reader
+    * producer head, consumer tail
+    * compression instance handle
+    * compressed/uncompressed send queue
+    * statistics trackers
+*/
 typedef struct {
     ring_entry_t entries[RING_SIZE];
     int compression_level;
     float compressed_fraction; 
+    file_reader_t file_reader;
     
     struct {
         volatile uint32_t tail;
         uint64_t jobs_submitted;
+        uint64_t app_bytes_generated;
         char pad[CACHE_LINE_SIZE - 16];
     } __attribute__((aligned(CACHE_LINE_SIZE))) producer;
     
@@ -135,6 +180,8 @@ typedef struct {
     volatile uint64_t uncompressed_packets_sent;
     volatile uint64_t compressed_packets_sent; 
     volatile uint64_t socket_blocked_count;
+    volatile uint64_t network_bytes_in;
+    volatile uint64_t network_bytes_out;
     struct {
         uint64_t total_compressions;
         uint64_t total_bytes_in;
@@ -149,6 +196,7 @@ typedef struct {
 
 } ring_buffer_t;
 
+//args for network, consumer, producer threads
 typedef struct {
     ring_buffer_t *ring;
     int thread_id;
@@ -157,6 +205,7 @@ typedef struct {
 
 static ring_buffer_t *g_ring = NULL;
 
+//ensure each thread is pinned to different cores (on same NUMA node)
 int pin_thread_to_core(int core_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -166,7 +215,7 @@ int pin_thread_to_core(int core_id) {
     int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
     
     if (result == 0) {
-        printf("Thread pinned to core %d\n", core_id);
+        INFO_PRINT("Thread pinned to core %d\n", core_id);
     } else {
         fprintf(stderr, "Failed to pin thread to core %d: %s\n", core_id, strerror(result));
     }
@@ -174,6 +223,121 @@ int pin_thread_to_core(int core_id) {
     return result;
 }
 
+//functions for handling compression benchmark files
+//---------------------------------------------------
+int load_single_file(file_reader_t *reader, const char *file_path) {
+    struct stat st;
+    if (stat(file_path, &st) != 0) {
+        fprintf(stderr, "Failed to stat file: %s\n", file_path);
+        return -1;
+    }
+    
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Not a regular file: %s\n", file_path);
+        return -1;
+    }
+    
+    reader->file_path = strdup(file_path);
+    if (!reader->file_path) {
+        fprintf(stderr, "Failed to allocate memory for file path\n");
+        return -1;
+    }
+    
+    reader->current_file = NULL;
+    reader->current_file_offset = 0;
+    reader->current_file_size = st.st_size;
+    reader->file_reopen_count = 0;
+    pthread_mutex_init(&reader->file_lock, NULL);
+    
+    INFO_PRINT("Loaded benchmark file: %s (size: %lu bytes)\n", file_path, reader->current_file_size);
+    return 0;
+}
+
+int open_file(file_reader_t *reader) {
+    if (reader->current_file) {
+        fclose(reader->current_file);
+        reader->current_file = NULL;
+    }
+    
+    if (!reader->file_path) {
+        return -1;
+    }
+    
+    reader->current_file = fopen(reader->file_path, "rb");
+    
+    if (!reader->current_file) {
+        fprintf(stderr, "Failed to open file: %s\n", reader->file_path);
+        return -1;
+    }
+    
+    reader->current_file_offset = 0;
+    reader->file_reopen_count++;
+    
+    //DEBUG_PRINT("Reopened file: %s (reopen count: %lu)\n", reader->file_path, reader->file_reopen_count);
+    return 0;
+}
+
+ssize_t read_chunk_from_files(file_reader_t *reader, uint8_t *buffer, size_t chunk_size) {
+    pthread_mutex_lock(&reader->file_lock);
+    
+    if (!reader->current_file) {
+        if (open_file(reader) != 0) {
+            pthread_mutex_unlock(&reader->file_lock);
+            return -1;
+        }
+    }
+    
+    size_t total_read = 0;
+    
+    while (total_read < chunk_size) {
+        size_t to_read = chunk_size - total_read;
+        size_t bytes_read = fread(buffer + total_read, 1, to_read, reader->current_file);
+        
+        if (bytes_read > 0) {
+            total_read += bytes_read;
+            reader->current_file_offset += bytes_read;
+        }
+        
+        // Only reopen if we hit EOF or error (not just a short read)
+        if (bytes_read == 0) {
+            if (feof(reader->current_file)) {
+                if (open_file(reader) != 0) {
+                    pthread_mutex_unlock(&reader->file_lock);
+                    return total_read > 0 ? total_read : -1;
+                }
+            } else if (ferror(reader->current_file)) {
+                // Error occurred
+                pthread_mutex_unlock(&reader->file_lock);
+                return total_read > 0 ? total_read : -1;
+            }
+        }
+        
+        if (total_read >= chunk_size) {
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&reader->file_lock);
+    return total_read;
+}
+
+void cleanup_file_reader(file_reader_t *reader) {
+    if (reader->current_file) {
+        fclose(reader->current_file);
+        reader->current_file = NULL;
+    }
+    
+    if (reader->file_path) {
+        free(reader->file_path);
+        reader->file_path = NULL;
+    }
+    
+    pthread_mutex_destroy(&reader->file_lock);
+    
+    INFO_PRINT("File was reopened %lu times during experiment\n", reader->file_reopen_count);
+}
+
+// callback gets fired on polling when QAT jobs complete
 void qat_dc_callback(void *pCallbackTag, CpaStatus status)
 {
     static uint64_t callback_count = 0;
@@ -201,7 +365,7 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         __sync_synchronize();
         
         if (callback_count % 10000 == 0) {
-            printf("Callback: %lu successful compressions\n", callback_count);
+            DEBUG_PRINT("Callback: %lu successful compressions\n", callback_count);
         }
     } else {
         printf("QAT compression failed: %d (callback #%lu)\n", status, callback_count);
@@ -212,6 +376,11 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
     entry->complete_time = clock();
 }
 
+/* Initialize QAT
+    * Find instance on NUMA Node 2
+    * Set up Address Translation for DMA
+    * Set up session data (algorithm, level, etc)
+*/
 int qat_init(ring_buffer_t *ring)
 {
     CpaStatus status;
@@ -248,7 +417,7 @@ int qat_init(ring_buffer_t *ring)
         status = cpaDcInstanceGetInfo2(instances[i], &info);
         
         if (status == CPA_STATUS_SUCCESS) {
-            printf("Instance %d: nodeAffinity = %d\n", i, info.nodeAffinity);
+            DEBUG_PRINT("Instance %d: nodeAffinity = %d\n", i, info.nodeAffinity);
             
             if (info.nodeAffinity == target_numa_node && selected_instance == -1) {
                 selected_instance = i;
@@ -257,10 +426,10 @@ int qat_init(ring_buffer_t *ring)
     }
 
     if (selected_instance == -1) {
-        printf("Warning: No QAT on NUMA %d, using instance 0\n", target_numa_node);
+        INFO_PRINT("Warning: No QAT on NUMA %d, using instance 0\n", target_numa_node);
         selected_instance = 0;
     } else {
-        printf("Selected QAT instance %d on NUMA node %d\n", 
+        INFO_PRINT("Selected QAT instance %d on NUMA node %d\n", 
                selected_instance, target_numa_node);
     }
     
@@ -274,7 +443,7 @@ int qat_init(ring_buffer_t *ring)
         return -1;
     }
     
-    Cpa16U numBuffers = 512; 
+    Cpa16U numBuffers = 2048; 
     status = cpaDcStartInstance(ring->dcInstance, numBuffers, NULL);
     if (status != CPA_STATUS_SUCCESS) {
         printf("Failed to start DC instance: %d\n", status);
@@ -296,14 +465,20 @@ int qat_init(ring_buffer_t *ring)
     } 
 
     
-    ring->sessionSetupData.compLevel = qat_level;              // Fastest compression
-    ring->sessionSetupData.compType = CPA_DC_DEFLATE;          // Standard DEFLATE
-    ring->sessionSetupData.huffType = CPA_DC_HT_STATIC;        // Static Huffman for speed
+    ring->sessionSetupData.compLevel = qat_level;            
+    ring->sessionSetupData.compType = CPA_DC_DEFLATE;          // DEFLATE
+    ring->sessionSetupData.huffType = CPA_DC_HT_STATIC;        //static huffman
     ring->sessionSetupData.autoSelectBestHuffmanTree = CPA_FALSE;
     ring->sessionSetupData.sessDirection = CPA_DC_DIR_COMPRESS;
     ring->sessionSetupData.sessState = CPA_DC_STATELESS;       
     ring->sessionSetupData.checksum = CPA_DC_CRC32;
-    ring->sessionSetupData.windowSize = 15;                     
+    ring->sessionSetupData.windowSize = 15;       
+    
+    // ring->sessionSetupData.compLevel = qat_level;              
+    // ring->sessionSetupData.compType = CPA_DC_LZ4;              // config for LZ4
+    // ring->sessionSetupData.sessDirection = CPA_DC_DIR_COMPRESS;
+    // ring->sessionSetupData.sessState = CPA_DC_STATELESS;       
+    // ring->sessionSetupData.checksum = CPA_DC_NONE;   
     
     status = cpaDcGetSessionSize(ring->dcInstance, 
                                  &ring->sessionSetupData,
@@ -333,10 +508,11 @@ int qat_init(ring_buffer_t *ring)
         return -1;
     }
     
-    printf("QAT initialization successful\n");
+    INFO_PRINT("QAT initialization successful\n");
     return 0;
 }
 
+// Function to allocate buffers for each ring entry
 int allocate_qat_buffers(ring_entry_t *entry, CpaInstanceHandle dcInstance)
 {
     Cpa32U metaSize = 0;
@@ -396,7 +572,8 @@ int allocate_qat_buffers(ring_entry_t *entry, CpaInstanceHandle dcInstance)
     return 0;
 }
 
-ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction)
+//Set up Ring Buffer - file reader (load benchmark file), send queues, ring buffer entries, initialize qat 
+ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction, const char *input_file)
 {
     ring_buffer_t *ring = aligned_alloc(CACHE_LINE_SIZE, sizeof(ring_buffer_t));
     if (!ring) return NULL;
@@ -428,6 +605,12 @@ ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction
         free(ring);
         return NULL;
     }
+
+    if (load_single_file(&ring->file_reader, input_file) != 0) {
+        fprintf(stderr, "Failed to load input file: %s\n", input_file);
+        free(ring);
+        return NULL;
+    }
     
     for (int i = 0; i < RING_SIZE; i++) {
         ring->entries[i].status = JOB_EMPTY;
@@ -445,161 +628,195 @@ ring_buffer_t* ring_buffer_init(int compression_level, float compressed_fraction
     return ring;
 }
 
-
+/* PRODUCER THREAD
+    * Depending on user input compression fraction, reads file data and submits compression jobs (or leaves data uncompressed)
+        * TODO: change this to choose compressed path except when ring buffer full OR QAT backpressure
+    * 64 KB chunks per compression job
+*/
 void* producer_thread(void *arg)
 {
     thread_args_t* args = (thread_args_t*) arg;
     ring_buffer_t *ring = args->ring;
     int thread_id = args->thread_id;
     pin_thread_to_core(args->core_id);
-    printf("Producer thread %d started on core %d\n", thread_id, args->core_id);
+    INFO_PRINT("Producer thread %d started on core %d\n", thread_id, args->core_id);
+
 
     CpaStatus status;
     uint64_t retry_count = 0;
     uint64_t ring_full_count = 0;
     uint64_t queue_full_count = 0;
-
     uint64_t bytes_generated = 0;
     uint64_t packets_generated = 0;
     time_t last_report = time(NULL);
-    
-    char test_data[64 * 1024];
-    memset(test_data, 'A', sizeof(test_data));
-    
+  
+    const size_t CHUNK_SIZE = 64 * 1024;
+    char temp_buffer[CHUNK_SIZE];
+  
     while (ring->running) {
         float rand_val = (float)rand() / RAND_MAX;
-        bool use_compressed = (rand_val < ring->compressed_fraction); 
-        
+        bool use_compressed = (rand_val < ring->compressed_fraction);
+      
         if (use_compressed) {
             uint32_t current_tail = ring->producer.tail;
             uint32_t next_tail = (current_tail + 1) & ring->mask;
-            
+          
+            //RING BUFFER FULL
             if (next_tail == ring->consumer.head) {
                 ring_full_count++;
                 if (ring_full_count % 1000000000 == 0) {
-                    printf("Producer: Ring buffer full (count: %lu)\n", ring_full_count);
+                    DEBUG_PRINT("Producer: Ring buffer full (count: %lu)\n", ring_full_count);
                 }
-                //usleep(10);
-                continue;  // retry
-            }            
+                continue; 
+            }  
+              
+            //RING BUFFER FULL
             ring_entry_t *entry = &ring->entries[current_tail];
             if(entry->status != JOB_EMPTY) {
                 ring_full_count++;
                 if (ring_full_count % 1000000000 == 0) {
-                    printf("Producer: Ring buffer full, ENTRY STATUS NONEMPTY (count: %lu)\n", ring_full_count);
+                    DEBUG_PRINT("Producer: Ring buffer full, ENTRY STATUS NONEMPTY (count: %lu)\n", ring_full_count);
                 }
-                //usleep(10);
                 continue;
             }
+
+            memset(&entry->dcResults, 0, sizeof(entry->dcResults));
+            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
+            entry->pFlatDstBuffer->pData = entry->pDstData; // Ensure pointer is correct
+            entry->pFlatSrcBuffer->pData = entry->pSrcData;
             ring_full_count = 0;
-            
+          
             if (!ring->running) break;
-            bytes_generated += sizeof(test_data);
-            packets_generated++; 
-            
-            memcpy(entry->pSrcData, test_data, sizeof(test_data));
-            entry->srcDataSize = sizeof(test_data);
-            entry->pFlatSrcBuffer->dataLenInBytes = sizeof(test_data);
-            
-            //allows receiver to uncompress
+            ring->producer.app_bytes_generated += CHUNK_SIZE;
+          
+            //read 64KB chunk from File into source data
+            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
+            if (bytes_read != CHUNK_SIZE) {
+                fprintf(stderr, "Incomplete read: got %zd, expected %zu\n", bytes_read, CHUNK_SIZE);
+                continue;
+            }
+            //TODO: read data directly into srcData buffer instead of temp + memcpy
+            memcpy(entry->pSrcData, temp_buffer, bytes_read);
+
+            bytes_generated += bytes_read;
+            packets_generated++;
+            entry->srcDataSize = bytes_read;
+            entry->pFlatSrcBuffer->dataLenInBytes = bytes_read;
+          
+            //allows receiver to uncompress by giving compression metadata
             entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
             entry->header.magic = 0x51415443;
             entry->header.sequence_number = entry->sequence_number;
-            entry->header.uncompressed_size = sizeof(test_data);
+            entry->header.uncompressed_size = bytes_read;
             entry->header.algorithm = 0;
             entry->header.compression_level = ring->compression_level;
-            
+          
             entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-            
+          
             CpaDcOpData opData = {0};
             opData.flushFlag = CPA_DC_FLUSH_FINAL;
             opData.compressAndVerify = CPA_TRUE;
-            
+          
             entry->submit_time = clock();
-            
-            // Submit to QAT
+  
+            //Submit to QAT
             status = cpaDcCompressData2(ring->dcInstance, ring->sessionHandle,
                                        entry->pSrcBuffer, entry->pDstBuffer,
                                        &opData, &entry->dcResults, entry);
+          
             
             if (status == CPA_STATUS_SUCCESS) {
+                //Submission successful
                 if (!ring->qat_stats.timing_started) {
                     clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
                     __sync_synchronize();
                     ring->qat_stats.timing_started = true;
-                }  
-                __sync_synchronize();
-                entry->status = JOB_SUBMITTED;
+                } 
+                entry->status = JOB_SUBMITTED; //change entry from EMPTY -> SUBMITTED
+                __atomic_thread_fence(__ATOMIC_RELEASE);  
                 ring->producer.tail = next_tail;
                 ring->producer.jobs_submitted++;
-                retry_count = 0;  
+                retry_count = 0; 
             } else if (status == CPA_STATUS_RETRY) {
                 //QAT backpressure here
                 retry_count++;
                 if (retry_count % 1000 == 0) {
-                    printf("Producer: QAT retry count: %lu\n", retry_count);
+                    DEBUG_PRINT("Producer: QAT retry count: %lu\n", retry_count);
                 }
-                //usleep(10);
-                continue;  
+                continue; 
             } else {
-                printf("Producer: QAT submission failed with status %d\n", status);
-                //usleep(100);
+                INFO_PRINT("Producer: QAT submission failed with status %d\n", status);
                 continue;
             }
-            
+          
         } else {
+            //UNCOMPRESSED DATA PATH
             uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
             uint32_t tail = queue->tail;
             uint32_t next_tail = (tail + 1) & queue->mask;
-            
+            __sync_synchronize();
+            ring->producer.app_bytes_generated += CHUNK_SIZE; //theoretical application bytes (without limitless queue)
+
+
             if (next_tail == queue->head) {
                 queue_full_count++;
                 if (queue_full_count % 10000 == 0) {
-                    printf("Producer: Uncompressed queue full (count: %lu)\n", queue_full_count);
+                    DEBUG_PRINT("Producer: Uncompressed queue full (count: %lu)\n", queue_full_count);
                 }
-                continue;  
+                continue; 
             }
             queue_full_count = 0;
             uncompressed_send_entry_t *entry = &queue->entries[tail];
-            memcpy(entry->data, test_data, sizeof(test_data));
-            entry->length = sizeof(test_data);
+            //read 64KB chunk from file into next available uncompressed send queue entry
+            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, entry->data, CHUNK_SIZE);
+            if (bytes_read <= 0) {
+                fprintf(stderr, "Failed to read chunk from files\n");
+                continue;
+            }
+            bytes_generated += bytes_read;
+            packets_generated++;
+            queue_full_count = 0;
+            entry->length = bytes_read;
             entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-            
+          
             __sync_synchronize();
             queue->tail = next_tail;
-            ring->producer.jobs_submitted++;
-            
+            ring->producer.jobs_submitted++;          
         }
+
 
         time_t now = time(NULL);
         if (now - last_report >= 5) {
             double elapsed = (double)(now - last_report);
             double mbps = (bytes_generated / elapsed) / (1024.0 * 1024.0);
             double pps = packets_generated / elapsed;
-            
-            printf("Producer %d: %.2f MB/s, %.0f packets/s (generated)\n", 
+          
+            DEBUG_PRINT("Producer %d: %.2f MB/s, %.0f packets/s (generated)\n",
                 thread_id, mbps, pps);
-            
+          
             bytes_generated = 0;
             packets_generated = 0;
             last_report = now;
         }
-        
-        //usleep(10); 
+      
     }
-    
-    printf("Producer thread exiting (submitted: %lu)\n", ring->producer.jobs_submitted);
+  
+    INFO_PRINT("Producer thread exiting (submitted: %lu)\n", ring->producer.jobs_submitted);
     return NULL;
 }
 
-
+/* CONSUMER THREAD
+    * Polls QAT so callbacks fire
+    * Polls on ring buffer head for status to be COMPLETED
+    * Pushes results into the compressed send queue
+*/
 void* consumer_thread(void *arg)
 {
     thread_args_t* args = (thread_args_t*)arg;
     ring_buffer_t *ring = args->ring;
     int thread_id = args->thread_id;
     pin_thread_to_core(args->core_id);
-    printf("Consumer thread %d started on core %d\n", thread_id, args->core_id);
+    INFO_PRINT("Consumer thread %d started on core %d\n", thread_id, args->core_id);
 
     uint64_t send_count = 0;
     uint64_t stuck_count = 0;
@@ -608,25 +825,47 @@ void* consumer_thread(void *arg)
         
     while (ring->running) {
         poll_count++;
-        icp_sal_DcPollInstance(ring->dcInstance, 64);
-        // if(poll_count % 1000000 == 0) {
-        //     printf("Consumer: Polled %lu times...\n", poll_count);
-        // }
+        //Poll QAT instance
+        CpaStatus poll_status = icp_sal_DcPollInstance(ring->dcInstance, 0);
+        if (poll_status != CPA_STATUS_SUCCESS && poll_status != CPA_STATUS_RETRY) {
+            if (stuck_count % 10000000 == 0) {
+                INFO_PRINT("Consumer: Poll failed with status %d\n", poll_status);
+            }
+        }
+        if(poll_count % 100000000 == 0) {
+            DEBUG_PRINT("Consumer: Polled %lu times...\n", poll_count);
+        }
         
         uint32_t current_head = ring->consumer.head;
         ring_entry_t *entry = &ring->entries[current_head];
         job_status_t current_status = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
         
         if (current_status == JOB_COMPLETED) {
+            //current head is completed
             stuck_count = 0;
             compressed_send_queue_t *queue = &ring->compressed_send_queue;
             uint32_t next_tail = (queue->tail + 1) & queue->mask;
-            
+
+
+            //compressed send queue is full 
             if (next_tail == queue->head) {
+                static uint64_t discard_count = 0;
+                discard_count++;
+
                 if(compressed_full % 1000000 == 0) {
-                    printf("Consumer: Compressed Queue Full, We are Spinning...\n");
+                    DEBUG_PRINT("Consumer: Compressed Queue Full, We are Spinning...\n");
                 }
                 compressed_full++;
+
+                if (discard_count % 1000000 == 0) {
+                    DEBUG_PRINT("Consumer: Discarded %lu compressed entries\n",
+                                discard_count);
+                }
+
+                //after a while change the status to empty and move to next compressed send queue entry
+                __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+                ring->consumer.head = (current_head + 1) & ring->mask;
+
                 continue;
             }
             
@@ -635,158 +874,212 @@ void* consumer_thread(void *arg)
             __sync_synchronize();
             queue->tail = next_tail;
             
+            //mark job as empty after its complete and advance head
+            entry->status = JOB_EMPTY;
             ring->consumer.jobs_sent++;
             ring->consumer.head = (current_head + 1) & ring->mask;
             
             send_count++;
             if (send_count % 10000 == 0) {
-                printf("Consumer: Sent %lu entries to network thread\n", send_count);
+                DEBUG_PRINT("Consumer: Sent %lu entries to network thread\n", send_count);
             }
             
         } else if (current_status == JOB_ERROR) {
+            //job is error state, change it emoty and advance head
             entry->status = JOB_EMPTY;
-            ring->consumer.head = (current_head + 1) & ring->mask;
+            ring->consumer.head = (current_head + 1) & ring->mask; 
             stuck_count = 0;
+            INFO_PRINT("Consumer: JOB STUCK IN ERROR %lu times\n", stuck_count);
+            INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
+                    entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
         } else if (current_status == JOB_SUBMITTED) {
+            //job is stuck in submitted..
             stuck_count++;
             if(stuck_count % 1000000 == 0) {
-                printf("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
-                printf("  Forcing to ERROR state and skipping...\n");
-                entry->status = JOB_ERROR;
-                ring->consumer.head = (current_head + 1) & ring->mask;
-                stuck_count = 0;
+                // INFO_PRINT("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
+                // INFO_PRINT("  Forcing to ERROR state and skipping...\n");
+                // entry->status = JOB_EMPTY;
+                // ring->consumer.head = (current_head + 1) & ring->mask;
+                // stuck_count = 0;
+                INFO_PRINT("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
+                INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
+                        entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
+                // entry->status = JOB_EMPTY;
+                // ring->consumer.head = (current_head + 1) & ring->mask;
+                // stuck_count = 0;
 
             } 
-            __builtin_ia32_pause();
         }
     }
     
-    printf("Consumer thread exiting\n");
+    INFO_PRINT("Consumer thread exiting\n");
     return NULL;
 }
 
+/* NETWORK THREAD
+    * if there is data in compressed send queue, send first --> then fallback to uncompressed queue
+
+*/
 void* network_sender_thread(void *arg)
 {
     thread_args_t* args = (thread_args_t*) arg;
     ring_buffer_t *ring = args->ring;
     pin_thread_to_core(args->core_id);
-    printf("Network sender thread started on core %d\n", args->core_id);
-
+    INFO_PRINT("Network sender thread started on core %d\n", args->core_id);
 
     uint64_t last_packets_sent = 0;
     time_t last_report_time = time(NULL);
     uint64_t sent_entries = 0;
+    uint64_t uncomp_sent_entries = 0;
     uint64_t no_data_counter = 0;
-
-    // uint64_t uncomp_bytes_attempted = 0;
-    // uint64_t uncomp_packets_attempted = 0;
-    // time_t last_uncomp_report = time(NULL);
-        
+      
     while (ring->running) {
         bool sent_something = false;
         time_t now = time(NULL);
-        if (now - last_report_time >= 5) {  
+        if (now - last_report_time >= 5) { 
             uint64_t current_packets = ring->compressed_packets_sent + ring->uncompressed_packets_sent;
             uint64_t packets_per_sec = (current_packets - last_packets_sent) / (now - last_report_time);
-            
-            printf("Network: %lu packets/sec (comp:%lu uncomp:%lu queued_comp:%u queued_uncomp:%u)\n",
+          
+            //periodic debugging output
+            DEBUG_PRINT("Network: %lu packets/sec (comp:%lu uncomp:%lu queued_comp:%u queued_uncomp:%u)\n",
                    packets_per_sec,
                    ring->compressed_packets_sent,
                    ring->uncompressed_packets_sent,
                    (ring->compressed_send_queue.tail - ring->compressed_send_queue.head) & ring->compressed_send_queue.mask,
                    (ring->uncompressed_send_queue.tail - ring->uncompressed_send_queue.head) & ring->uncompressed_send_queue.mask);
-            
+          
             last_packets_sent = current_packets;
             last_report_time = now;
         }
-        
+      
         // Process COMPRESSED queue
         compressed_send_queue_t *comp_queue = &ring->compressed_send_queue;
         while (comp_queue->head != comp_queue->tail) {
             compressed_send_entry_t *send_msg = &comp_queue->entries[comp_queue->head];
             ring_entry_t *entry = send_msg->entry;
-            
+          
             if (ring->socket_fd > 0) {
                 struct iovec iov[2];
                 iov[0].iov_base = &entry->header;
                 iov[0].iov_len = sizeof(compression_header_t);
                 iov[1].iov_base = entry->pDstData;
                 iov[1].iov_len = entry->producedSize;
-                
+
+
                 ssize_t sent = writev(ring->socket_fd, iov, 2);
-                
+              
                 if (sent == sizeof(compression_header_t) + entry->producedSize) {
                     ring->consumer.bytes_sent += entry->producedSize;
                     __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
-                    
+                    __sync_fetch_and_add(&ring->network_bytes_out, sent);
+                    __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
                     entry->status = JOB_EMPTY;
                     sent_entries++;
                     if(sent_entries % 10000 == 0) {
-                        printf("Network Send Thread: Sent %lu entries\n", sent_entries);
+                        DEBUG_PRINT("Network Send Thread: Sent %lu compressed entries\n", sent_entries);
                     }
                     sent_something = true;
                     comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
                 } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     __sync_fetch_and_add(&ring->socket_blocked_count, 1);
-                    usleep(10);
-                    continue;  
+                    continue;
+                } else if (sent > 0) {
+                    __sync_fetch_and_add(&ring->network_bytes_out, sent);
+                    __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
+
                 } else {
                     perror("compressed send failed");
                     entry->status = JOB_EMPTY;
                     comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
                 }
-
-                // entry->status = JOB_EMPTY;
-                // __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
-                // comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
-                // sent_something = true;
-                // sent_entries++;
-                // if(sent_entries % 10000 == 0) {
-                //     printf("Network Send Thread: Sent %lu entries\n", sent_entries);
-                // }
             }
         }
-        
+      
         // Process UNCOMPRESSED queue
         if(!sent_something) {
             uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
             while (uncomp_queue->head != uncomp_queue->tail) {
                 uncompressed_send_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
-                    
+
+
+                  
                 if (ring->socket_fd > 0) {
-                    ssize_t sent = send(ring->socket_fd, entry->data, 
+                    ssize_t sent = send(ring->socket_fd, entry->data,
                                        entry->length, MSG_DONTWAIT);
-                    
+                  
                     if (sent == entry->length) {
                         ring->consumer.bytes_sent += entry->length;
                         __sync_fetch_and_add(&ring->uncompressed_packets_sent, 1);
+                        __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+                        __sync_fetch_and_add(&ring->network_bytes_out, sent);
                         sent_something = true;
+                        uncomp_sent_entries++;
+                        if(uncomp_sent_entries % 10000 == 0) {
+                            DEBUG_PRINT("Network Send Thread: Sent %lu uncompressed entries\n", sent_entries);
+                        }
                         uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        __sync_fetch_and_add(&ring->socket_blocked_count, 1);
-                        usleep(10);
+                        // fprintf(stderr, "DEBUG: Got EAGAIN/EWOULDBLOCK (errno=%d)\n", errno);
+                        // __sync_fetch_and_add(&ring->socket_blocked_count, 1);
+                        // usleep(10);
                         continue;
+                    } else if (sent < 0) {
+                        fprintf(stderr, "Send error (errno=%d): %s\n", errno, strerror(errno));
+                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     } else {
-                        perror("uncompressed send failed");
+                        __sync_fetch_and_add(&ring->network_bytes_out, sent);
+                         __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+
+
                         uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     }
-                } 
+                }
             }
-            
+          
         }
+
 
         if (!sent_something) {
             no_data_counter++;
-            if (no_data_counter % 100000000 == 0) { 
-                printf("Network: No data to send (count: %lu)\n", no_data_counter);
+            if (no_data_counter % 100000000 == 0) {
+                DEBUG_PRINT("Network: No data to send (count: %lu)\n", no_data_counter);
             }
             //usleep(10);
         } else {
-            no_data_counter = 0; 
+            no_data_counter = 0;
         }
     }
+  
+    INFO_PRINT("Network sender thread exiting\n");
+    return NULL;
+}
+
+//periodically prints queue occupancies
+void* monitor_thread(void *arg)
+{
+    thread_args_t* args = (thread_args_t*) arg;
+    ring_buffer_t *ring = args->ring;
+    pin_thread_to_core(args->core_id);
+    INFO_PRINT("Monitor thread started on core %d\n", args->core_id);
     
-    printf("Network sender thread exiting\n");
+    while (ring->running) {
+        sleep(2); 
+        
+        uint32_t ring_occupancy = (ring->producer.tail - ring->consumer.head) & ring->mask;
+        uint32_t comp_occupancy = (ring->compressed_send_queue.tail - 
+                                    ring->compressed_send_queue.head) & 
+                                   ring->compressed_send_queue.mask;
+        uint32_t uncomp_occupancy = (ring->uncompressed_send_queue.tail - 
+                                      ring->uncompressed_send_queue.head) & 
+                                     ring->uncompressed_send_queue.mask;
+        
+        INFO_PRINT("Queue Occupancy: Ring=%u/%d, Comp=%u/%d, Uncomp=%u/%d\n",
+               ring_occupancy, RING_SIZE,
+               comp_occupancy, SEND_QUEUE_SIZE,
+               uncomp_occupancy, SEND_QUEUE_SIZE);
+    }
+    
+    INFO_PRINT("Monitor thread exiting\n");
     return NULL;
 }
 
@@ -840,6 +1133,8 @@ void ring_buffer_cleanup(ring_buffer_t *ring)
     }
     
     icp_sal_userStop();
+    cleanup_file_reader(&ring->file_reader);
+
     
     free(ring);
 }
@@ -868,7 +1163,6 @@ int setup_server_socket(int port)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
-    // inet_pton(AF_INET, "192.168.101.2", &server_addr.sin_addr);
     
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
@@ -882,7 +1176,7 @@ int setup_server_socket(int port)
         return -1;
     }
     
-    printf("Server listening on port %d\n", port);
+    INFO_PRINT("Server listening on port %d\n", port);
     
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -894,7 +1188,7 @@ int setup_server_socket(int port)
         return -1;
     }
     
-    printf("Client connected from %s:%d\n",
+    INFO_PRINT("Client connected from %s:%d\n",
            inet_ntoa(client_addr.sin_addr),
            ntohs(client_addr.sin_port));
 
@@ -915,7 +1209,7 @@ int setup_server_socket(int port)
     getsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen);
     getsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen);
     
-    printf("Actual socket buffers: send=%d bytes (%.2f MB), recv=%d bytes (%.2f MB)\n", 
+    INFO_PRINT("Actual socket buffers: send=%d bytes (%.2f MB), recv=%d bytes (%.2f MB)\n", 
             sndbuf, sndbuf/(1024.0*1024.0), 
             rcvbuf, rcvbuf/(1024.0*1024.0));
     
@@ -927,33 +1221,64 @@ int setup_server_socket(int port)
 }
 
 
-
-void print_qat_stats(ring_buffer_t *ring)
+//print qat_stats
+void print_qat_stats(ring_buffer_t *ring, double elapsed_sec)
 {
     if (ring->qat_stats.total_compressions > 0) {
-        double avg_time = (double)ring->qat_stats.total_compression_time_us / 
-                         ring->qat_stats.total_compressions;
-        double compression_ratio = (double)ring->qat_stats.total_bytes_out / 
-                                  ring->qat_stats.total_bytes_in;
-        double elapsed_sec = (ring->qat_stats.last_callback_time.tv_sec - 
-                                    ring->qat_stats.first_submit_time.tv_sec) +
-                                   (ring->qat_stats.last_callback_time.tv_nsec - 
-                                    ring->qat_stats.first_submit_time.tv_nsec) / 1e9;
+        // double avg_time = (double)ring->qat_stats.total_compression_time_us / 
+        //                  ring->qat_stats.total_compressions;
+        // double compression_ratio = (double)ring->qat_stats.total_bytes_out / 
+        //                           ring->qat_stats.total_bytes_in;
+        // double elapsed_sec = (ring->qat_stats.last_callback_time.tv_sec - 
+        //                             ring->qat_stats.first_submit_time.tv_sec) +
+        //                            (ring->qat_stats.last_callback_time.tv_nsec - 
+        //                             ring->qat_stats.first_submit_time.tv_nsec) / 1e9;
                
-        double mb_processed = (double)ring->qat_stats.total_bytes_in / (1024 * 1024);
-        double mb_bytes_out = (double)ring->qat_stats.total_bytes_out / (1024 * 1024);
-        double throughput_mbps = mb_processed / elapsed_sec;
-        double output_throughput = mb_bytes_out / elapsed_sec;
-        double ops_per_sec = ring->qat_stats.total_compressions / elapsed_sec;
+        // double mb_processed = (double)ring->qat_stats.total_bytes_in / (1024 * 1024);
+        // double mb_bytes_out = (double)ring->qat_stats.total_bytes_out / (1024 * 1024);
+        // double throughput_mbps = mb_processed / elapsed_sec;
+        // double output_throughput = mb_bytes_out / elapsed_sec;
+        // double ops_per_sec = ring->qat_stats.total_compressions / elapsed_sec;
         
-        printf("QAT Performance Stats:\n");
-        printf("  Total compressions: %lu\n", ring->qat_stats.total_compressions);
-        printf("  Average compression time: %.2f µs\n", avg_time);
-        printf("  Compression ratio: %.2f%%\n", compression_ratio * 100);
-        printf("  Operations per second: %.0f\n", ops_per_sec);
-        printf("  Throughput: %.2f MB/s\n", throughput_mbps);
-        printf("  Output Throughput: %.2f MB/s\n", output_throughput);
+        // printf("QAT Performance Stats:\n");
+        // printf("  Total compressions: %lu\n", ring->qat_stats.total_compressions);
+        // printf("  Average compression time: %.2f µs\n", avg_time);
+        // printf("  Compression ratio: %.2f%%\n", compression_ratio * 100);
+        // printf("  Operations per second: %.0f\n", ops_per_sec);
+        // printf("  Throughput: %.2f MB/s\n", throughput_mbps);
+        // printf("  Output Throughput: %.2f MB/s\n", output_throughput);
+        double net_in_gbps = (ring->qat_stats.total_bytes_in * 8.0) / (elapsed_sec * 1e9);
+        double net_out_gbps = (ring->qat_stats.total_bytes_out * 8.0) / (elapsed_sec * 1e9);
+
+        INFO_PRINT("QAT Stats:\n");
+        INFO_PRINT("    TX QAT Bytes In: %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_in, net_in_gbps);
+        INFO_PRINT("    TX QAT Bytes Out: %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_out, net_out_gbps);
     }
+}
+
+//determine which benchmark to use based on command line arg
+const char* map_file_number(const char *input) {
+    static const char *base_path = "/home/npunati2/SquashBench/"; //TODO: change to where squash benchmarks are located
+    static char full_path[512];
+    
+    if (strlen(input) == 1 && input[0] >= '1' && input[0] <= '5') {
+        int file_num = input[0] - '0';
+        const char *filename = NULL;
+        
+        switch(file_num) {
+            case 1: filename = "geo.protodata"; break;
+            case 2: filename = "nci"; break;
+            case 3: filename = "ptt5"; break;
+            case 4: filename = "sum"; break;
+            case 5: filename = "xml"; break;
+            default: return NULL;
+        }
+        
+        snprintf(full_path, sizeof(full_path), "%s%s", base_path, filename);
+        return full_path;
+    }
+    
+    return input;
 }
 
 int main(int argc, char *argv[])
@@ -962,22 +1287,42 @@ int main(int argc, char *argv[])
     float compressed_fraction = 0.5; 
     int port = 9999; 
     int numa_node2_base = 64;
+    char *input_arg = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
             compression_level = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--debug") == 0) {
+            g_debug_enabled = true;
+            INFO_PRINT("Debug mode enabled\n");
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             compressed_fraction = atof(argv[++i]);
             if (compressed_fraction < 0.0 || compressed_fraction > 1.0) {
                 printf("Error: fraction must be 0.0-1.0\n");
                 return 1;
             }
+        } else if(strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            input_arg = argv[++i];
         }
     }
 
-    printf("Initializing QAT compression pipeline...\n");
+    if (!input_arg) {
+        fprintf(stderr, "Error: Input file is required (use -i option)\n\n");
+        return 1;
+    }
     
-    ring_buffer_t *ring = ring_buffer_init(compression_level, compressed_fraction);
+    const char *input_file = map_file_number(input_arg);
+    if (!input_file) {
+        fprintf(stderr, "Error: Invalid file number or path: %s\n\n", input_arg);
+        return 1;
+    }
+
+    INFO_PRINT("Initializing QAT compression pipeline...\n");
+    INFO_PRINT("Configuration: input_file=%s, compression_level=%d, compressed_fraction=%.2f\n", 
+            input_file, compression_level, compressed_fraction);
+    
+        
+    ring_buffer_t *ring = ring_buffer_init(compression_level, compressed_fraction, input_file);
     if (!ring) {
         printf("Failed to initialize ring buffer\n");
         return 1;
@@ -992,8 +1337,9 @@ int main(int argc, char *argv[])
     pthread_t producer_tids[NUM_PRODUCERS];
     pthread_t consumer_tids[NUM_CONSUMERS];
     pthread_t sender_tids[NUM_SENDERS];
+    pthread_t monitor_tid; 
 
-    for (int i = 0; i < NUM_PRODUCERS; i++) {
+    for (int i = 0; i < NUM_PRODUCERS; i++) { //core 64
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
@@ -1006,7 +1352,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (int i = 0; i < NUM_CONSUMERS; i++) {
+    for (int i = 0; i < NUM_CONSUMERS; i++) { //core 65
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
@@ -1019,11 +1365,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (int i = 0; i < NUM_SENDERS; i++) {
+    for (int i = 0; i < NUM_SENDERS; i++) { //core 66
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
-        args->core_id = numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + i;  // Core 70
+        args->core_id = numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + i;  
         
         if (pthread_create(&sender_tids[i], NULL, network_sender_thread, args) != 0) {
             printf("Failed to create sender thread %d\n", i);
@@ -1032,16 +1378,28 @@ int main(int argc, char *argv[])
         }
     }
 
+    thread_args_t *monitor_args = malloc(sizeof(thread_args_t));
+    monitor_args->ring = ring;
+    monitor_args->thread_id = 0;
+    monitor_args->core_id = numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + NUM_SENDERS;
 
-    printf("Pipeline running with %d producers, %d consumers, %d senders\n",
+    if (pthread_create(&monitor_tid, NULL, monitor_thread, monitor_args) != 0) { // core 67
+        printf("Failed to create monitor thread\n");
+        ring->running = false;
+        return 1;
+    }
+
+    struct timespec start_ts, end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
+    INFO_PRINT("Pipeline running with %d producers, %d consumers, %d senders\n",
         NUM_PRODUCERS, NUM_CONSUMERS, NUM_SENDERS);
-    printf("All threads pinned to NUMA node 2 (cores %d-%d)\n",
+    INFO_PRINT("All threads pinned to NUMA node 2 (cores %d-%d)\n",
             numa_node2_base, 
             numa_node2_base + NUM_PRODUCERS + NUM_CONSUMERS + NUM_SENDERS - 1);
 
     sleep(30);  
     
-    printf("\nShutting down...\n");
+    INFO_PRINT("Shutting down...\n");
     ring->running = false;
     
     for (int i = 0; i < NUM_PRODUCERS; i++) {
@@ -1053,15 +1411,30 @@ int main(int argc, char *argv[])
     for (int i = 0; i < NUM_SENDERS; i++) {
         pthread_join(sender_tids[i], NULL);
     }
+    pthread_join(monitor_tid, NULL);
     
-    printf("\nStatistics:\n");
-    printf("  Jobs submitted: %lu\n", ring->producer.jobs_submitted);
-    printf("  Jobs sent: %lu\n", ring->consumer.jobs_sent);
-    printf("  Bytes sent: %lu\n", ring->consumer.bytes_sent);
-    printf("  Compressed packets: %lu\n", ring->compressed_packets_sent);
-    printf("  Uncompressed packets: %lu\n", ring->uncompressed_packets_sent);
-    printf("  Socket Blocked Count: %lu\n", ring->socket_blocked_count);
-    print_qat_stats(ring);
+    clock_gettime(CLOCK_MONOTONIC, &end_ts);
+
+    double elapsed_sec = (end_ts.tv_sec - start_ts.tv_sec) + (end_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
+    INFO_PRINT("Elapsed Seconds: %f\n", elapsed_sec);
+    double app_gbps = (ring->producer.app_bytes_generated * 8.0) / (elapsed_sec * 1e9);
+    double net_in_gbps = (ring->network_bytes_in * 8.0) / (elapsed_sec * 1e9);
+    double net_out_gbps = (ring->network_bytes_out * 8.0) / (elapsed_sec * 1e9);
+
+    INFO_PRINT("TX Statistics:\n");
+    INFO_PRINT("    TX App Bytes Generated: %lu --> Throughput(%.2f Gbps)\n", ring->producer.app_bytes_generated, app_gbps);
+    INFO_PRINT("    TX Network Bytes In: %lu --> Throughput(%.2f Gbps)\n", ring->network_bytes_in, net_in_gbps);
+    INFO_PRINT("    TX Network Bytes Out: %lu --> Throughput(%.2f Gbps)\n", ring->network_bytes_out, net_out_gbps);
+    print_qat_stats(ring, elapsed_sec);
+    INFO_PRINT("  Compressed packets: %lu\n", ring->compressed_packets_sent);
+    INFO_PRINT("  Uncompressed packets: %lu\n", ring->uncompressed_packets_sent);
+    // printf("  Jobs submitted: %lu\n", ring->producer.jobs_submitted);
+    // printf("  Jobs sent: %lu\n", ring->consumer.jobs_sent);
+    // printf("  Bytes sent: %lu\n", ring->consumer.bytes_sent);
+    // printf("  Compressed packets: %lu\n", ring->compressed_packets_sent);
+    // printf("  Uncompressed packets: %lu\n", ring->uncompressed_packets_sent);
+    // printf("  Socket Blocked Count: %lu\n", ring->socket_blocked_count);
+    // print_qat_stats(ring);
 
     if (ring->socket_fd > 0) {
         close(ring->socket_fd);
@@ -1073,6 +1446,6 @@ int main(int argc, char *argv[])
 
     ring_buffer_cleanup(ring);
     
-    printf("Pipeline shutdown complete\n");
+    INFO_PRINT("Pipeline shutdown complete\n");
     return 0;
 }
