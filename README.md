@@ -19,7 +19,7 @@ make fast      # Build fast receiver only
 
 ### Sender
 ```bash
-sudo ./build/qat_sender -f <fraction> -l <level>
+sudo ./build/qat_sender -f <fraction> -l <level> -i <benchmark_file_number>
 ```
 
 Options:
