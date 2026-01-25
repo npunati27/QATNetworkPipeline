@@ -68,10 +68,10 @@ run-fast: $(FAST_TARGET)
 
 # Run sender with specific arguments
 run-uncompressed: $(SENDER_TARGET)
-	sudo $(SENDER_TARGET) -f 0.0 -l 1
+	sudo $(SENDER_TARGET) -f 0.0 -l 6
 
 run-compressed: $(SENDER_TARGET)
-	sudo $(SENDER_TARGET) -f 1.0 -l 1
+	sudo $(SENDER_TARGET) -f 1.0 -l 6
 
 
 # Rebuild (clean + build)
