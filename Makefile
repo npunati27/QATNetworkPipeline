@@ -12,13 +12,16 @@ BUILD_DIR = build
 SENDER_TARGET = $(BUILD_DIR)/qat_sender
 PIPELINE_TARGET = $(BUILD_DIR)/pipeline_receiver
 FAST_TARGET = $(BUILD_DIR)/fast_receiver
+QAT_TARGET = $(BUILD_DIR)/qat_receiver
 
 # Source files
 SENDER_SRCS = qat_comp_sender.c
 PIPELINE_SRCS = receivers/qat_pipeline_reciever.c
 FAST_SRCS = receivers/fast_receiver.c
+QAT_SRCS = receivers/qat_reciever.c
 
-all: $(SENDER_TARGET) $(PIPELINE_TARGET) $(FAST_TARGET)
+# Default target - build all
+all: $(SENDER_TARGET) $(PIPELINE_TARGET) $(FAST_TARGET) $(QAT_TARGET)
 
 $(SENDER_TARGET): $(SENDER_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
@@ -32,11 +35,16 @@ $(FAST_TARGET): $(FAST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 	@echo "Build complete: $(FAST_TARGET)"
 
+$(QAT_TARGET): $(QAT_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+	@echo "Build complete: $(QAT_TARGET)"
+
+# Create build directory if it doesn't exist
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -f $(SENDER_TARGET) $(PIPELINE_TARGET) $(FAST_TARGET)
+	rm -f $(SENDER_TARGET) $(PIPELINE_TARGET) $(FAST_TARGET) $(QAT_TARGET)
 	rm -f *.o receivers/*.o
 	@echo "Cleaned build artifacts"
 
@@ -46,11 +54,18 @@ pipeline: $(PIPELINE_TARGET)
 
 fast: $(FAST_TARGET)
 
+qat: $(QAT_TARGET)
+
+# Run targets
 run-sender: $(SENDER_TARGET)
 	sudo $(SENDER_TARGET)
 
 run-pipeline: $(PIPELINE_TARGET)
 	sudo $(PIPELINE_TARGET)
+
+run-qat-receiver: $(QAT_TARGET)
+	sudo $(QAT_TARGET)
+
 
 run-fast: $(FAST_TARGET)
 	sudo $(FAST_TARGET)

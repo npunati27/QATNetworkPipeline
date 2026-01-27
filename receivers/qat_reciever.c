@@ -17,7 +17,8 @@
 #include <errno.h>
 #include <signal.h>
 
-#define MAGIC_NUMBER 0x51415443
+#define MAGIC_COMPRESSED   0x51415443
+#define MAGIC_UNCOMPRESSED 0x51415452
 #define MAX_BUFFER_SIZE 131072
 #define RING_SIZE 16384
 #define CACHE_LINE_SIZE 64
@@ -317,92 +318,74 @@ int recv_exact(int sockfd, void *buffer, size_t len)
 void* network_thread(void *arg)
 {
     int sockfd = *(int*)arg;
-    uint64_t ring_full_count = 0;
     uint8_t *temp_buffer = malloc(MAX_BUFFER_SIZE);
+    compression_header_t header;
     
     printf("Network thread started\n");
     
     while (g_ring->running) {
-        uint32_t magic;
-        ssize_t n = recv(sockfd, &magic, sizeof(uint32_t), MSG_PEEK);
-        
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            perror("recv magic");
+        //don't peek first 4 bytes, read the entire compression header (both compressed + uncompressed packets have it)
+        if (recv_exact(sockfd, &header, sizeof(compression_header_t)) < 0) {
+            printf("Connection closed or error reading header\n");
             break;
         }
-        if (n != sizeof(uint32_t)) {
-            printf("Short read on magic: %ld\n", n);
-            break;
-        }
-        
-        if (magic == MAGIC_NUMBER) {
-            // Get ring slot
+
+        if (header.magic == MAGIC_COMPRESSED) {
+            // compressed path
             uint32_t current_tail = g_ring->producer.tail;
             uint32_t next_tail = (current_tail + 1) & g_ring->mask;
             
             if (next_tail == g_ring->consumer.head) {
-                // ring full -> drop packet
-                
-                ring_full_count++;
-                if (ring_full_count % 10000 == 0) {
-                    printf("Network: Ring full, dropped %lu packets\n", ring_full_count);
+                // drain if no space in ring buffer -> this is why qat bytes don't align on RX and TX
+                if (recv_exact(sockfd, temp_buffer, header.compressed_size) < 0) {
+                    printf("Error draining compressed data\n");
+                    break;
                 }
+                __sync_fetch_and_add(&g_ring->ring_full_count, 1);
+                __sync_fetch_and_add(&g_ring->compressed_packets_recv, 1);
+                __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+                                sizeof(compression_header_t) + header.compressed_size);
                 continue;
             }
             
             ring_entry_t *entry = &g_ring->entries[current_tail];
             
-            if (entry->status != JOB_EMPTY) {
-                // Entry not empty - drain socket and drop
-                if (ring_full_count % 1000000 == 0) {
-                    printf("Network: Entry not empty (count: %lu)\n", ring_full_count);
-                }
-                ring_full_count++;
-                continue;
+            entry->header = header;
+            
+            if (recv_exact(sockfd, entry->pSrcData, header.compressed_size) < 0) {
+                printf("Error reading compressed data\n");
+                break;
             }
-            ring_full_count = 0;
             
-            entry->header.magic = magic;
-
-            //receive header
-            if (recv_exact(sockfd, &entry->header, sizeof(compression_header_t)) < 0) break;
+            entry->srcDataSize = header.compressed_size;
+            entry->pFlatSrcBuffer->dataLenInBytes = header.compressed_size;
+            entry->sequence_number = header.sequence_number;
+            entry->status = JOB_READY; 
             
-            //receive compressed data directly into pre-allocated buffer
-            if (recv_exact(sockfd, entry->pSrcData, entry->header.compressed_size) < 0) break;
-            
-            //setup metadata
-            entry->srcDataSize = entry->header.compressed_size;
-            entry->pFlatSrcBuffer->dataLenInBytes = entry->header.compressed_size;
-            entry->sequence_number = entry->header.sequence_number;
-            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-
-            __sync_fetch_and_add(&g_ring->producer.packets_received, 1);
-            __sync_fetch_and_add(&g_ring->producer.bytes_received, sizeof(compression_header_t) + entry->header.compressed_size);
-            __sync_fetch_and_add(&g_ring->compressed_packets_recv, 1);
-            
-            // Mark as READY (ready to submit)
             __sync_synchronize();
-            entry->status = JOB_READY;
-            __sync_synchronize();
-            
             g_ring->producer.tail = next_tail;
-            
-        } else {
-            //uncompressed data
-            ssize_t remaining = recv(sockfd, temp_buffer, MAX_BUFFER_SIZE - sizeof(uint32_t), MSG_DONTWAIT);
-            if (remaining < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    perror("recv uncompressed");
-                    break;
-                }
-                remaining = 0;
+            __sync_fetch_and_add(&g_ring->compressed_packets_recv, 1);
+            __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+                                sizeof(compression_header_t) + header.compressed_size);
+
+        } else if (header.magic == MAGIC_UNCOMPRESSED) {
+            // uncompressed path 
+            if (recv_exact(sockfd, temp_buffer, header.uncompressed_size) < 0) {
+                printf("Error reading uncompressed data\n");
+                break;
             }
-            
-            ssize_t total = sizeof(uint32_t) + remaining;
-            __sync_fetch_and_add(&g_ring->producer.packets_received, 1);
-            __sync_fetch_and_add(&g_ring->producer.bytes_received, total);
+
             __sync_fetch_and_add(&g_ring->uncompressed_packets_recv, 1);
+            __sync_fetch_and_add(&g_ring->uncompressed_bytes, header.uncompressed_size);
+            __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+                                sizeof(compression_header_t) + header.uncompressed_size);
+                                
+        } else {
+            printf("Protocol Error: Unknown magic 0x%08X (expected 0x%08X or 0x%08X)\n", 
+                   header.magic, MAGIC_COMPRESSED, MAGIC_UNCOMPRESSED);
+            printf("Header details: seq=%lu, comp_size=%u, uncomp_size=%u\n",
+                   header.sequence_number, header.compressed_size, header.uncompressed_size);
+            break;
         }
     }
     
