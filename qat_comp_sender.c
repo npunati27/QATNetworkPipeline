@@ -36,6 +36,8 @@
 #define NUM_PRODUCERS 1
 #define NUM_CONSUMERS 1
 #define NUM_SENDERS 1
+#define MAGIC_COMPRESSED   0x51415443
+#define MAGIC_UNCOMPRESSED 0x51415452
 
 static bool g_debug_enabled = false;
 
@@ -123,6 +125,7 @@ typedef struct {
 
 //uncompressed send entry just has pointer to data
 typedef struct {
+    compression_header_t header;
     uint8_t *data;        
     size_t length;
     uint64_t sequence_number;
@@ -364,7 +367,7 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         entry->status = JOB_COMPLETED;
         __sync_synchronize();
         
-        if (callback_count % 10000 == 0) {
+        if (callback_count % 100000 == 0) {
             DEBUG_PRINT("Callback: %lu successful compressions\n", callback_count);
         }
     } else {
@@ -658,18 +661,18 @@ void* producer_thread(void *arg)
         //bool use_compressed = (rand_val < ring->compressed_fraction);
 
         uint32_t current_tail = ring->producer.tail;
+        ring_entry_t *entry = &ring->entries[current_tail];
         uint32_t next_tail = (current_tail + 1) & ring->mask;
         bool compression_submitted = false;
 
-        if(next_tail != ring->consumer.head) {
+        if(next_tail != ring->consumer.head && entry->status == JOB_EMPTY) {
             //ring buffer not full
-            ring_entry_t *entry = &ring->entries[current_tail];
-            if(entry->status != JOB_EMPTY) {
-                memset(&entry->dcResults, 0, sizeof(entry->dcResults));
-                entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-                entry->pFlatDstBuffer->pData = entry->pDstData;
-                entry->pFlatSrcBuffer->pData = entry->pSrcData;
-            }
+            // if(entry->status != JOB_EMPTY) {
+            //     memset(&entry->dcResults, 0, sizeof(entry->dcResults));
+            //     entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
+            //     entry->pFlatDstBuffer->pData = entry->pDstData;
+            //     entry->pFlatSrcBuffer->pData = entry->pSrcData;
+            // }
 
             ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, entry->pSrcData, CHUNK_SIZE);
             ring->producer.app_bytes_generated += CHUNK_SIZE;
@@ -679,7 +682,7 @@ void* producer_thread(void *arg)
             
                 //allows receiver to uncompress by giving compression metadata
                 entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-                entry->header.magic = 0x51415443;
+                entry->header.magic = MAGIC_COMPRESSED;
                 entry->header.sequence_number = entry->sequence_number;
                 entry->header.uncompressed_size = bytes_read;
                 entry->header.algorithm = 0;
@@ -723,6 +726,11 @@ void* producer_thread(void *arg)
                         uncompressed_send_entry_t *u_entry = &queue->entries[u_tail];
                         // Copy from QAT src buffer to uncompressed queue
                         memcpy(u_entry->data, entry->pSrcData, bytes_read);
+                        u_entry->header.magic = MAGIC_UNCOMPRESSED;
+                        u_entry->header.sequence_number = entry->sequence_number;
+                        u_entry->header.uncompressed_size = bytes_read;
+                        u_entry->header.compressed_size = bytes_read;
+                        u_entry->header.algorithm = 99;
                         u_entry->length = bytes_read;
                         u_entry->sequence_number = entry->sequence_number;
                         
@@ -759,6 +767,11 @@ void* producer_thread(void *arg)
                 if (bytes_read > 0) {
                     u_entry->length = bytes_read;
                     u_entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
+                    u_entry->header.magic = MAGIC_UNCOMPRESSED;
+                    u_entry->header.sequence_number = entry->sequence_number;
+                    u_entry->header.uncompressed_size = bytes_read;
+                    u_entry->header.compressed_size = bytes_read;
+                    u_entry->header.algorithm = 99;
                     
                     __sync_synchronize();
                     queue->tail = u_next_tail;
@@ -971,6 +984,7 @@ void* network_sender_thread(void *arg)
                 } else if (sent > 0) {
                     __sync_fetch_and_add(&ring->network_bytes_out, sent);
                     __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
+                    //INFO_PRINT("PARTIAL SEND REACHED\n");
 
                 } else {
                     perror("compressed send failed");
@@ -984,18 +998,21 @@ void* network_sender_thread(void *arg)
         if(!sent_something) {
             uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
             while (uncomp_queue->head != uncomp_queue->tail) {
-                uncompressed_send_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
-
-
+                uncompressed_send_entry_t *u_entry = &uncomp_queue->entries[uncomp_queue->head];
                   
                 if (ring->socket_fd > 0) {
-                    ssize_t sent = send(ring->socket_fd, entry->data,
-                                       entry->length, MSG_DONTWAIT);
+                    struct iovec iov[2];
+                    iov[0].iov_base = &u_entry->header;
+                    iov[0].iov_len = sizeof(compression_header_t);
+                    iov[1].iov_base = u_entry->data;
+                    iov[1].iov_len = u_entry->length;
+
+                    ssize_t sent = writev(ring->socket_fd, iov, 2);
                   
-                    if (sent == entry->length) {
-                        ring->consumer.bytes_sent += entry->length;
+                    if (sent == u_entry->length + sizeof(compression_header_t)) {
+                        ring->consumer.bytes_sent += u_entry->length;
                         __sync_fetch_and_add(&ring->uncompressed_packets_sent, 1);
-                        __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+                        __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
                         __sync_fetch_and_add(&ring->network_bytes_out, sent);
                         sent_something = true;
                         uncomp_sent_entries++;
@@ -1013,10 +1030,11 @@ void* network_sender_thread(void *arg)
                         uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     } else {
                         __sync_fetch_and_add(&ring->network_bytes_out, sent);
-                         __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+                        __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
+                        //INFO_PRINT("PARTIAL SEND REACHED\n");
 
 
-                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
+                        //uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     }
                 }
             }
