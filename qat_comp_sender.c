@@ -36,6 +36,8 @@
 #define NUM_PRODUCERS 1
 #define NUM_CONSUMERS 1
 #define NUM_SENDERS 1
+#define MAGIC_COMPRESSED   0x51415443
+#define MAGIC_UNCOMPRESSED 0x51415452
 
 static bool g_debug_enabled = false;
 
@@ -123,6 +125,7 @@ typedef struct {
 
 //uncompressed send entry just has pointer to data
 typedef struct {
+    compression_header_t header;
     uint8_t *data;        
     size_t length;
     uint64_t sequence_number;
@@ -364,7 +367,7 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         entry->status = JOB_COMPLETED;
         __sync_synchronize();
         
-        if (callback_count % 10000 == 0) {
+        if (callback_count % 100000 == 0) {
             DEBUG_PRINT("Callback: %lu successful compressions\n", callback_count);
         }
     } else {
@@ -643,164 +646,159 @@ void* producer_thread(void *arg)
 
 
     CpaStatus status;
-    uint64_t retry_count = 0;
     uint64_t ring_full_count = 0;
     uint64_t queue_full_count = 0;
+    uint64_t qat_backpressure_count = 0;
     uint64_t bytes_generated = 0;
     uint64_t packets_generated = 0;
     time_t last_report = time(NULL);
   
     const size_t CHUNK_SIZE = 64 * 1024;
-    char temp_buffer[CHUNK_SIZE];
+    //char temp_buffer[CHUNK_SIZE];
   
     while (ring->running) {
-        float rand_val = (float)rand() / RAND_MAX;
-        bool use_compressed = (rand_val < ring->compressed_fraction);
-      
-        if (use_compressed) {
-            uint32_t current_tail = ring->producer.tail;
-            uint32_t next_tail = (current_tail + 1) & ring->mask;
-          
-            //RING BUFFER FULL
-            if (next_tail == ring->consumer.head) {
-                ring_full_count++;
-                if (ring_full_count % 1000000000 == 0) {
-                    DEBUG_PRINT("Producer: Ring buffer full (count: %lu)\n", ring_full_count);
-                }
-                continue; 
-            }  
-              
-            //RING BUFFER FULL
-            ring_entry_t *entry = &ring->entries[current_tail];
-            if(entry->status != JOB_EMPTY) {
-                ring_full_count++;
-                if (ring_full_count % 1000000000 == 0) {
-                    DEBUG_PRINT("Producer: Ring buffer full, ENTRY STATUS NONEMPTY (count: %lu)\n", ring_full_count);
-                }
-                continue;
-            }
+        //float rand_val = (float)rand() / RAND_MAX;
+        //bool use_compressed = (rand_val < ring->compressed_fraction);
 
-            memset(&entry->dcResults, 0, sizeof(entry->dcResults));
-            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-            entry->pFlatDstBuffer->pData = entry->pDstData; // Ensure pointer is correct
-            entry->pFlatSrcBuffer->pData = entry->pSrcData;
-            ring_full_count = 0;
-          
-            if (!ring->running) break;
+        uint32_t current_tail = ring->producer.tail;
+        ring_entry_t *entry = &ring->entries[current_tail];
+        uint32_t next_tail = (current_tail + 1) & ring->mask;
+        bool compression_submitted = false;
+
+        if(next_tail != ring->consumer.head && entry->status == JOB_EMPTY) {
+            //ring buffer not full
+            // if(entry->status != JOB_EMPTY) {
+            //     memset(&entry->dcResults, 0, sizeof(entry->dcResults));
+            //     entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
+            //     entry->pFlatDstBuffer->pData = entry->pDstData;
+            //     entry->pFlatSrcBuffer->pData = entry->pSrcData;
+            // }
+
+            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, entry->pSrcData, CHUNK_SIZE);
             ring->producer.app_bytes_generated += CHUNK_SIZE;
-          
-            //read 64KB chunk from File into source data
-            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
-            if (bytes_read != CHUNK_SIZE) {
-                fprintf(stderr, "Incomplete read: got %zd, expected %zu\n", bytes_read, CHUNK_SIZE);
-                continue;
-            }
-            //TODO: read data directly into srcData buffer instead of temp + memcpy
-            memcpy(entry->pSrcData, temp_buffer, bytes_read);
-
-            bytes_generated += bytes_read;
-            packets_generated++;
-            entry->srcDataSize = bytes_read;
-            entry->pFlatSrcBuffer->dataLenInBytes = bytes_read;
-          
-            //allows receiver to uncompress by giving compression metadata
-            entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-            entry->header.magic = 0x51415443;
-            entry->header.sequence_number = entry->sequence_number;
-            entry->header.uncompressed_size = bytes_read;
-            entry->header.algorithm = 0;
-            entry->header.compression_level = ring->compression_level;
-          
-            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-          
-            CpaDcOpData opData = {0};
-            opData.flushFlag = CPA_DC_FLUSH_FINAL;
-            opData.compressAndVerify = CPA_TRUE;
-          
-            entry->submit_time = clock();
-  
-            //Submit to QAT
-            status = cpaDcCompressData2(ring->dcInstance, ring->sessionHandle,
-                                       entry->pSrcBuffer, entry->pDstBuffer,
-                                       &opData, &entry->dcResults, entry);
-          
+            if(bytes_read > 0) {
+                entry->srcDataSize = bytes_read;
+                entry->pFlatSrcBuffer->dataLenInBytes = bytes_read;
             
-            if (status == CPA_STATUS_SUCCESS) {
-                //Submission successful
-                if (!ring->qat_stats.timing_started) {
-                    clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
-                    __sync_synchronize();
-                    ring->qat_stats.timing_started = true;
-                } 
-                entry->status = JOB_SUBMITTED; //change entry from EMPTY -> SUBMITTED
-                __atomic_thread_fence(__ATOMIC_RELEASE);  
-                ring->producer.tail = next_tail;
-                ring->producer.jobs_submitted++;
-                retry_count = 0; 
-            } else if (status == CPA_STATUS_RETRY) {
-                //QAT backpressure here
-                retry_count++;
-                if (retry_count % 1000 == 0) {
-                    DEBUG_PRINT("Producer: QAT retry count: %lu\n", retry_count);
+                //allows receiver to uncompress by giving compression metadata
+                entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
+                entry->header.magic = MAGIC_COMPRESSED;
+                entry->header.sequence_number = entry->sequence_number;
+                entry->header.uncompressed_size = bytes_read;
+                entry->header.algorithm = 0;
+                entry->header.compression_level = ring->compression_level;
+            
+                entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
+            
+                CpaDcOpData opData = {0};
+                opData.flushFlag = CPA_DC_FLUSH_FINAL;
+                opData.compressAndVerify = CPA_TRUE;
+            
+                entry->submit_time = clock();
+    
+                //Submit to QAT
+                status = cpaDcCompressData2(ring->dcInstance, ring->sessionHandle,
+                                        entry->pSrcBuffer, entry->pDstBuffer,
+                                        &opData, &entry->dcResults, entry);
+                
+                if(status == CPA_STATUS_SUCCESS) {
+                    if (!ring->qat_stats.timing_started) {
+                        clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
+                        __sync_synchronize();
+                        ring->qat_stats.timing_started = true;
+                    } 
+                    entry->status = JOB_SUBMITTED;
+                    __atomic_thread_fence(__ATOMIC_RELEASE);  
+                    ring->producer.tail = next_tail;
+                    ring->producer.jobs_submitted++;
+                    
+                    bytes_generated += bytes_read;
+                    packets_generated++;
+                    compression_submitted = true;
+                } else if(status == CPA_STATUS_RETRY) {
+                    qat_backpressure_count++;
+                    
+                    //try sending to uncompressed datapath
+                    uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
+                    uint32_t u_tail = queue->tail;
+                    uint32_t u_next_tail = (u_tail + 1) & queue->mask;
+                    if (u_next_tail != queue->head) {
+                        uncompressed_send_entry_t *u_entry = &queue->entries[u_tail];
+                        // Copy from QAT src buffer to uncompressed queue
+                        memcpy(u_entry->data, entry->pSrcData, bytes_read);
+                        u_entry->header.magic = MAGIC_UNCOMPRESSED;
+                        u_entry->header.sequence_number = entry->sequence_number;
+                        u_entry->header.uncompressed_size = bytes_read;
+                        u_entry->header.compressed_size = bytes_read;
+                        u_entry->header.algorithm = 99;
+                        u_entry->length = bytes_read;
+                        u_entry->sequence_number = entry->sequence_number;
+                        
+                        __sync_synchronize();
+                        queue->tail = u_next_tail;
+                        ring->producer.jobs_submitted++;
+                        
+                        bytes_generated += bytes_read;
+                        packets_generated++;
+                        compression_submitted = true; 
+                    } else {
+                        //drop + retry full loop
+                        //both paths are ful
+                        __sync_fetch_and_sub(&ring->sequence_counter, 1);
+                        queue_full_count++;
+                    }
                 }
-                continue; 
-            } else {
-                INFO_PRINT("Producer: QAT submission failed with status %d\n", status);
-                continue;
             }
-          
         } else {
-            //UNCOMPRESSED DATA PATH
-            uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
-            uint32_t tail = queue->tail;
-            uint32_t next_tail = (tail + 1) & queue->mask;
-            __sync_synchronize();
-            ring->producer.app_bytes_generated += CHUNK_SIZE; //theoretical application bytes (without limitless queue)
-
-
-            if (next_tail == queue->head) {
-                queue_full_count++;
-                if (queue_full_count % 10000 == 0) {
-                    DEBUG_PRINT("Producer: Uncompressed queue full (count: %lu)\n", queue_full_count);
-                }
-                continue; 
-            }
-            queue_full_count = 0;
-            uncompressed_send_entry_t *entry = &queue->entries[tail];
-            //read 64KB chunk from file into next available uncompressed send queue entry
-            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, entry->data, CHUNK_SIZE);
-            if (bytes_read <= 0) {
-                fprintf(stderr, "Failed to read chunk from files\n");
-                continue;
-            }
-            bytes_generated += bytes_read;
-            packets_generated++;
-            queue_full_count = 0;
-            entry->length = bytes_read;
-            entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-          
-            __sync_synchronize();
-            queue->tail = next_tail;
-            ring->producer.jobs_submitted++;          
+            ring_full_count++;
         }
 
+        if(!compression_submitted) {
+            uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
+            uint32_t u_tail = queue->tail;
+            uint32_t u_next_tail = (u_tail + 1) & queue->mask;
+
+            if (u_next_tail != queue->head) {
+                uncompressed_send_entry_t *u_entry = &queue->entries[u_tail];
+                
+                //read into uncompressed queue entry directly
+                ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, u_entry->data, CHUNK_SIZE);
+                ring->producer.app_bytes_generated += CHUNK_SIZE;
+                if (bytes_read > 0) {
+                    u_entry->length = bytes_read;
+                    u_entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
+                    u_entry->header.magic = MAGIC_UNCOMPRESSED;
+                    u_entry->header.sequence_number = entry->sequence_number;
+                    u_entry->header.uncompressed_size = bytes_read;
+                    u_entry->header.compressed_size = bytes_read;
+                    u_entry->header.algorithm = 99;
+                    
+                    __sync_synchronize();
+                    queue->tail = u_next_tail;
+                    ring->producer.jobs_submitted++;
+                    
+                    bytes_generated += bytes_read;
+                    packets_generated++;
+                }
+            } else {
+                queue_full_count++;
+                //both paths are full
+            }
+        }
 
         time_t now = time(NULL);
         if (now - last_report >= 5) {
             double elapsed = (double)(now - last_report);
-            double mbps = (bytes_generated / elapsed) / (1024.0 * 1024.0);
-            double pps = packets_generated / elapsed;
-          
-            DEBUG_PRINT("Producer %d: %.2f MB/s, %.0f packets/s (generated)\n",
-                thread_id, mbps, pps);
+            double gbps = (bytes_generated * 8.0 / elapsed) / 1000000000.0;
+            
+            INFO_PRINT("Producer: %.3f Gbps | RingFull: %lu | QATBusy: %lu | QueueFull: %lu\n", gbps, ring_full_count, qat_backpressure_count, queue_full_count);
           
             bytes_generated = 0;
             packets_generated = 0;
             last_report = now;
         }
-      
     }
-  
+
     INFO_PRINT("Producer thread exiting (submitted: %lu)\n", ring->producer.jobs_submitted);
     return NULL;
 }
@@ -986,6 +984,7 @@ void* network_sender_thread(void *arg)
                 } else if (sent > 0) {
                     __sync_fetch_and_add(&ring->network_bytes_out, sent);
                     __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
+                    //INFO_PRINT("PARTIAL SEND REACHED\n");
 
                 } else {
                     perror("compressed send failed");
@@ -999,18 +998,21 @@ void* network_sender_thread(void *arg)
         if(!sent_something) {
             uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
             while (uncomp_queue->head != uncomp_queue->tail) {
-                uncompressed_send_entry_t *entry = &uncomp_queue->entries[uncomp_queue->head];
-
-
+                uncompressed_send_entry_t *u_entry = &uncomp_queue->entries[uncomp_queue->head];
                   
                 if (ring->socket_fd > 0) {
-                    ssize_t sent = send(ring->socket_fd, entry->data,
-                                       entry->length, MSG_DONTWAIT);
+                    struct iovec iov[2];
+                    iov[0].iov_base = &u_entry->header;
+                    iov[0].iov_len = sizeof(compression_header_t);
+                    iov[1].iov_base = u_entry->data;
+                    iov[1].iov_len = u_entry->length;
+
+                    ssize_t sent = writev(ring->socket_fd, iov, 2);
                   
-                    if (sent == entry->length) {
-                        ring->consumer.bytes_sent += entry->length;
+                    if (sent == u_entry->length + sizeof(compression_header_t)) {
+                        ring->consumer.bytes_sent += u_entry->length;
                         __sync_fetch_and_add(&ring->uncompressed_packets_sent, 1);
-                        __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+                        __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
                         __sync_fetch_and_add(&ring->network_bytes_out, sent);
                         sent_something = true;
                         uncomp_sent_entries++;
@@ -1028,10 +1030,11 @@ void* network_sender_thread(void *arg)
                         uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     } else {
                         __sync_fetch_and_add(&ring->network_bytes_out, sent);
-                         __sync_fetch_and_add(&ring->network_bytes_in, entry->length);
+                        __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
+                        //INFO_PRINT("PARTIAL SEND REACHED\n");
 
 
-                        uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
+                        //uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
                     }
                 }
             }
