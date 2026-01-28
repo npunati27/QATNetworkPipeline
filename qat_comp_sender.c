@@ -33,7 +33,7 @@
 #define MAX_BUFFER_SIZE 128 * 1024  
 #define SAMPLE_SIZE 256
 #define SEND_QUEUE_SIZE 128 * 1024   //128
-#define NUM_PRODUCERS 1
+#define NUM_PRODUCERS 2
 #define NUM_CONSUMERS 1
 #define NUM_SENDERS 1
 #define MAGIC_COMPRESSED   0x51415443
@@ -660,130 +660,102 @@ void* producer_thread(void *arg)
         //float rand_val = (float)rand() / RAND_MAX;
         //bool use_compressed = (rand_val < ring->compressed_fraction);
 
-        uint32_t current_tail = ring->producer.tail;
-        ring_entry_t *entry = &ring->entries[current_tail];
-        uint32_t next_tail = (current_tail + 1) & ring->mask;
-        bool compression_submitted = false;
+        uint8_t temp_buffer[CHUNK_SIZE];
+        ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
+        __sync_fetch_and_add(&ring->producer.app_bytes_generated, bytes_read);
 
-        if(next_tail != ring->consumer.head && entry->status == JOB_EMPTY) {
-            //ring buffer not full
-            // if(entry->status != JOB_EMPTY) {
-            //     memset(&entry->dcResults, 0, sizeof(entry->dcResults));
-            //     entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-            //     entry->pFlatDstBuffer->pData = entry->pDstData;
-            //     entry->pFlatSrcBuffer->pData = entry->pSrcData;
-            // }
+        if (bytes_read <= 0) continue;
 
-            ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, entry->pSrcData, CHUNK_SIZE);
-            ring->producer.app_bytes_generated += CHUNK_SIZE;
-            if(bytes_read > 0) {
-                entry->srcDataSize = bytes_read;
-                entry->pFlatSrcBuffer->dataLenInBytes = bytes_read;
+        uint32_t current_tail, next_tail;
+        ring_entry_t *entry;
+        bool ring_claimed = false;
+        current_tail = __atomic_load_n(&ring->producer.tail, __ATOMIC_ACQUIRE);
+        next_tail = (current_tail + 1) & ring->mask;
+        entry = &ring->entries[current_tail];
+
+        if (next_tail != __atomic_load_n(&ring->consumer.head, __ATOMIC_ACQUIRE) &&
+            __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE) == JOB_EMPTY) {
             
-                //allows receiver to uncompress by giving compression metadata
-                entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-                entry->header.magic = MAGIC_COMPRESSED;
-                entry->header.sequence_number = entry->sequence_number;
-                entry->header.uncompressed_size = bytes_read;
-                entry->header.algorithm = 0;
-                entry->header.compression_level = ring->compression_level;
-            
-                entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
-            
-                CpaDcOpData opData = {0};
-                opData.flushFlag = CPA_DC_FLUSH_FINAL;
-                opData.compressAndVerify = CPA_TRUE;
-            
-                entry->submit_time = clock();
-    
-                //Submit to QAT
-                status = cpaDcCompressData2(ring->dcInstance, ring->sessionHandle,
-                                        entry->pSrcBuffer, entry->pDstBuffer,
-                                        &opData, &entry->dcResults, entry);
-                
-                if(status == CPA_STATUS_SUCCESS) {
-                    if (!ring->qat_stats.timing_started) {
-                        clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
-                        __sync_synchronize();
-                        ring->qat_stats.timing_started = true;
-                    } 
-                    entry->status = JOB_SUBMITTED;
-                    __atomic_thread_fence(__ATOMIC_RELEASE);  
-                    ring->producer.tail = next_tail;
-                    ring->producer.jobs_submitted++;
-                    
-                    bytes_generated += bytes_read;
-                    packets_generated++;
-                    compression_submitted = true;
-                } else if(status == CPA_STATUS_RETRY) {
-                    qat_backpressure_count++;
-                    
-                    //try sending to uncompressed datapath
-                    uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
-                    uint32_t u_tail = queue->tail;
-                    uint32_t u_next_tail = (u_tail + 1) & queue->mask;
-                    if (u_next_tail != queue->head) {
-                        uncompressed_send_entry_t *u_entry = &queue->entries[u_tail];
-                        // Copy from QAT src buffer to uncompressed queue
-                        memcpy(u_entry->data, entry->pSrcData, bytes_read);
-                        u_entry->header.magic = MAGIC_UNCOMPRESSED;
-                        u_entry->header.sequence_number = entry->sequence_number;
-                        u_entry->header.uncompressed_size = bytes_read;
-                        u_entry->header.compressed_size = bytes_read;
-                        u_entry->header.algorithm = 99;
-                        u_entry->length = bytes_read;
-                        u_entry->sequence_number = entry->sequence_number;
-                        
-                        __sync_synchronize();
-                        queue->tail = u_next_tail;
-                        ring->producer.jobs_submitted++;
-                        
-                        bytes_generated += bytes_read;
-                        packets_generated++;
-                        compression_submitted = true; 
-                    } else {
-                        //drop + retry full loop
-                        //both paths are ful
-                        __sync_fetch_and_sub(&ring->sequence_counter, 1);
-                        queue_full_count++;
-                    }
-                }
+            if (__atomic_compare_exchange_n(&ring->producer.tail, &current_tail, next_tail,
+                                           false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+                ring_claimed = true;
             }
-        } else {
-            ring_full_count++;
         }
 
-        if(!compression_submitted) {
-            uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
-            uint32_t u_tail = queue->tail;
-            uint32_t u_next_tail = (u_tail + 1) & queue->mask;
+        if (!ring_claimed) {
+            ring_full_count++;
+            // Fall through to uncompressed path
+        } else {
+            // Step 3: Prepare and submit to QAT
+            memcpy(entry->pSrcData, temp_buffer, bytes_read);
+            entry->srcDataSize = bytes_read;
+            entry->pFlatSrcBuffer->dataLenInBytes = bytes_read;
+            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
+            
+            entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
+            entry->header.magic = MAGIC_COMPRESSED;
+            entry->header.sequence_number = entry->sequence_number;
+            entry->header.uncompressed_size = bytes_read;
+            entry->header.algorithm = 0;
+            entry->header.compression_level = ring->compression_level;
+            
+            CpaDcOpData opData = {0};
+            opData.flushFlag = CPA_DC_FLUSH_FINAL;
+            opData.compressAndVerify = CPA_TRUE;
+            entry->submit_time = clock();
 
-            if (u_next_tail != queue->head) {
-                uncompressed_send_entry_t *u_entry = &queue->entries[u_tail];
-                
-                //read into uncompressed queue entry directly
-                ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, u_entry->data, CHUNK_SIZE);
-                ring->producer.app_bytes_generated += CHUNK_SIZE;
-                if (bytes_read > 0) {
-                    u_entry->length = bytes_read;
-                    u_entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
-                    u_entry->header.magic = MAGIC_UNCOMPRESSED;
-                    u_entry->header.sequence_number = entry->sequence_number;
-                    u_entry->header.uncompressed_size = bytes_read;
-                    u_entry->header.compressed_size = bytes_read;
-                    u_entry->header.algorithm = 99;
-                    
+            CpaStatus status = cpaDcCompressData2(ring->dcInstance, ring->sessionHandle,
+                                                  entry->pSrcBuffer, entry->pDstBuffer,
+                                                  &opData, &entry->dcResults, entry);
+            
+            if (status == CPA_STATUS_SUCCESS) {
+                if (!ring->qat_stats.timing_started) {
+                    clock_gettime(CLOCK_MONOTONIC, &ring->qat_stats.first_submit_time);
                     __sync_synchronize();
-                    queue->tail = u_next_tail;
-                    ring->producer.jobs_submitted++;
-                    
-                    bytes_generated += bytes_read;
-                    packets_generated++;
+                    ring->qat_stats.timing_started = true;
                 }
+                __atomic_store_n(&entry->status, JOB_SUBMITTED, __ATOMIC_RELEASE);
+                __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
+                bytes_generated += bytes_read;
+                packets_generated++;
+                continue;  // Success! Don't fall through to uncompressed
+                
             } else {
-                queue_full_count++;
-                //both paths are full
+                // QAT RETRY or ERROR - mark as ERROR so consumer can skip it
+                qat_backpressure_count++;
+                __atomic_store_n(&entry->status, JOB_ERROR, __ATOMIC_RELEASE);  
+                // Fall through to uncompressed path
             }
+        }
+
+        uncompressed_send_queue_t *queue = &ring->uncompressed_send_queue;
+        uint32_t u_current_tail, u_next_tail;
+        
+        u_current_tail = __atomic_load_n(&queue->tail, __ATOMIC_ACQUIRE);
+        u_next_tail = (u_current_tail + 1) & queue->mask;
+        
+        if (u_next_tail != __atomic_load_n(&queue->head, __ATOMIC_ACQUIRE)) {
+            if (__atomic_compare_exchange_n(&queue->tail, &u_current_tail, u_next_tail,
+                                           false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+                
+                uncompressed_send_entry_t *u_entry = &queue->entries[u_current_tail];
+                
+                // Use data from temp_buffer (already read once)
+                memcpy(u_entry->data, temp_buffer, bytes_read);
+                u_entry->length = bytes_read;
+                u_entry->sequence_number = __sync_fetch_and_add(&ring->sequence_counter, 1);
+                u_entry->header.magic = MAGIC_UNCOMPRESSED;
+                u_entry->header.sequence_number = u_entry->sequence_number;
+                u_entry->header.uncompressed_size = bytes_read;
+                u_entry->header.compressed_size = bytes_read;
+                u_entry->header.algorithm = 99;
+                
+                __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
+                bytes_generated += bytes_read;
+                packets_generated++;
+            }
+        } else {
+            queue_full_count++;
         }
 
         time_t now = time(NULL);
@@ -873,7 +845,7 @@ void* consumer_thread(void *arg)
             queue->tail = next_tail;
             
             //mark job as empty after its complete and advance head
-            entry->status = JOB_EMPTY;
+            __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
             ring->consumer.jobs_sent++;
             ring->consumer.head = (current_head + 1) & ring->mask;
             
@@ -884,12 +856,12 @@ void* consumer_thread(void *arg)
             
         } else if (current_status == JOB_ERROR) {
             //job is error state, change it emoty and advance head
-            entry->status = JOB_EMPTY;
+            __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
             ring->consumer.head = (current_head + 1) & ring->mask; 
             stuck_count = 0;
-            INFO_PRINT("Consumer: JOB STUCK IN ERROR %lu times\n", stuck_count);
-            INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
-                    entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
+            INFO_PRINT("Consumer: JOB %lu STUCK IN ERROR %lu times\n", entry->sequence_number, stuck_count);
+            // INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
+            //         entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
         } else if (current_status == JOB_SUBMITTED) {
             //job is stuck in submitted..
             stuck_count++;
@@ -962,6 +934,9 @@ void* network_sender_thread(void *arg)
                 iov[0].iov_len = sizeof(compression_header_t);
                 iov[1].iov_base = entry->pDstData;
                 iov[1].iov_len = entry->producedSize;
+                if(&entry->header.magic != MAGIC_COMPRESSED) {
+                    INFO_PRINT("COMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n", &entry->header.magic);
+                }
 
 
                 ssize_t sent = writev(ring->socket_fd, iov, 2);
@@ -1006,6 +981,10 @@ void* network_sender_thread(void *arg)
                     iov[0].iov_len = sizeof(compression_header_t);
                     iov[1].iov_base = u_entry->data;
                     iov[1].iov_len = u_entry->length;
+
+                    if(&u_entry->header.magic != MAGIC_UNCOMPRESSED) {
+                        INFO_PRINT("UNCOMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n", &u_entry->header.magic);
+                    }
 
                     ssize_t sent = writev(ring->socket_fd, iov, 2);
                   
@@ -1166,10 +1145,6 @@ int setup_server_socket(int port)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
-<<<<<<< Updated upstream
-=======
-    inet_pton(AF_INET, "192.168.100.1", &server_addr.sin_addr);
->>>>>>> Stashed changes
     
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
@@ -1346,7 +1321,7 @@ int main(int argc, char *argv[])
     pthread_t sender_tids[NUM_SENDERS];
     pthread_t monitor_tid; 
 
-    for (int i = 0; i < NUM_PRODUCERS; i++) { //core 64
+    for (int i = 0; i < NUM_PRODUCERS; i++) { //core 64, 65
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
@@ -1359,7 +1334,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (int i = 0; i < NUM_CONSUMERS; i++) { //core 65
+    for (int i = 0; i < NUM_CONSUMERS; i++) { //core 66
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
@@ -1372,7 +1347,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    for (int i = 0; i < NUM_SENDERS; i++) { //core 66
+    for (int i = 0; i < NUM_SENDERS; i++) { //core 67
         thread_args_t *args = malloc(sizeof(thread_args_t));
         args->ring = ring;
         args->thread_id = i;
