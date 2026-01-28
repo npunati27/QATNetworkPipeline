@@ -1166,10 +1166,6 @@ int setup_server_socket(int port)
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
-<<<<<<< Updated upstream
-=======
-    inet_pton(AF_INET, "192.168.100.1", &server_addr.sin_addr);
->>>>>>> Stashed changes
     
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
