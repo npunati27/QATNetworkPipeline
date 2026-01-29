@@ -129,6 +129,7 @@ typedef struct {
     uint8_t *data;        
     size_t length;
     uint64_t sequence_number;
+    volatile int ready;
 } uncompressed_send_entry_t;
 
 //uncompressed send queue
@@ -718,13 +719,12 @@ void* producer_thread(void *arg)
                 __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
                 bytes_generated += bytes_read;
                 packets_generated++;
-                continue;  // Success! Don't fall through to uncompressed
+                continue;
                 
             } else {
-                // QAT RETRY or ERROR - mark as ERROR so consumer can skip it
+                //qat error or backpressure -> error state allows consumer to skip it
                 qat_backpressure_count++;
                 __atomic_store_n(&entry->status, JOB_ERROR, __ATOMIC_RELEASE);  
-                // Fall through to uncompressed path
             }
         }
 
@@ -749,6 +749,7 @@ void* producer_thread(void *arg)
                 u_entry->header.uncompressed_size = bytes_read;
                 u_entry->header.compressed_size = bytes_read;
                 u_entry->header.algorithm = 99;
+                __atomic_store_n(&u_entry->ready, 1, __ATOMIC_RELEASE);
                 
                 __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
                 bytes_generated += bytes_read;
@@ -763,7 +764,7 @@ void* producer_thread(void *arg)
             double elapsed = (double)(now - last_report);
             double gbps = (bytes_generated * 8.0 / elapsed) / 1000000000.0;
             
-            INFO_PRINT("Producer: %.3f Gbps | RingFull: %lu | QATBusy: %lu | QueueFull: %lu\n", gbps, ring_full_count, qat_backpressure_count, queue_full_count);
+            INFO_PRINT("Producer %d: %.3f Gbps | RingFull: %lu | QATBusy: %lu | QueueFull: %lu\n", thread_id, gbps, ring_full_count, qat_backpressure_count, queue_full_count);
           
             bytes_generated = 0;
             packets_generated = 0;
@@ -840,12 +841,11 @@ void* consumer_thread(void *arg)
             }
             
             queue->entries[queue->tail].entry = entry;
-            
             __sync_synchronize();
             queue->tail = next_tail;
             
             //mark job as empty after its complete and advance head
-            __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+            //__atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
             ring->consumer.jobs_sent++;
             ring->consumer.head = (current_head + 1) & ring->mask;
             
@@ -859,7 +859,7 @@ void* consumer_thread(void *arg)
             __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
             ring->consumer.head = (current_head + 1) & ring->mask; 
             stuck_count = 0;
-            INFO_PRINT("Consumer: JOB %lu STUCK IN ERROR %lu times\n", entry->sequence_number, stuck_count);
+            //INFO_PRINT("Consumer: JOB %lu STUCK IN ERROR\n", entry->sequence_number);
             // INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
             //         entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
         } else if (current_status == JOB_SUBMITTED) {
@@ -934,7 +934,7 @@ void* network_sender_thread(void *arg)
                 iov[0].iov_len = sizeof(compression_header_t);
                 iov[1].iov_base = entry->pDstData;
                 iov[1].iov_len = entry->producedSize;
-                if(&entry->header.magic != MAGIC_COMPRESSED) {
+                if(entry->header.magic != MAGIC_COMPRESSED) {
                     INFO_PRINT("COMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n", &entry->header.magic);
                 }
 
@@ -946,7 +946,7 @@ void* network_sender_thread(void *arg)
                     __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
                     __sync_fetch_and_add(&ring->network_bytes_out, sent);
                     __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
-                    entry->status = JOB_EMPTY;
+                    __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
                     sent_entries++;
                     if(sent_entries % 10000 == 0) {
                         DEBUG_PRINT("Network Send Thread: Sent %lu compressed entries\n", sent_entries);
@@ -974,6 +974,10 @@ void* network_sender_thread(void *arg)
             uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
             while (uncomp_queue->head != uncomp_queue->tail) {
                 uncompressed_send_entry_t *u_entry = &uncomp_queue->entries[uncomp_queue->head];
+
+                if (__atomic_load_n(&u_entry->ready, __ATOMIC_ACQUIRE) == 0) {
+                    break; 
+                }
                   
                 if (ring->socket_fd > 0) {
                     struct iovec iov[2];
@@ -982,7 +986,7 @@ void* network_sender_thread(void *arg)
                     iov[1].iov_base = u_entry->data;
                     iov[1].iov_len = u_entry->length;
 
-                    if(&u_entry->header.magic != MAGIC_UNCOMPRESSED) {
+                    if(u_entry->header.magic != MAGIC_UNCOMPRESSED) {
                         INFO_PRINT("UNCOMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n", &u_entry->header.magic);
                     }
 
