@@ -205,6 +205,7 @@ typedef struct {
     ring_buffer_t *ring;
     int thread_id;
     int core_id;
+    char* file_path;
 } thread_args_t;
 
 static ring_buffer_t *g_ring = NULL;
@@ -642,6 +643,7 @@ void* producer_thread(void *arg)
     thread_args_t* args = (thread_args_t*) arg;
     ring_buffer_t *ring = args->ring;
     int thread_id = args->thread_id;
+    char* file_path = args->file_path;
     pin_thread_to_core(args->core_id);
     INFO_PRINT("Producer thread %d started on core %d\n", thread_id, args->core_id);
 
@@ -653,7 +655,8 @@ void* producer_thread(void *arg)
     uint64_t bytes_generated = 0;
     uint64_t packets_generated = 0;
     time_t last_report = time(NULL);
-  
+    int local_fd = open(file_path, O_RDONLY);
+    uint64_t my_offset = 0;  
     const size_t CHUNK_SIZE = 64 * 1024;
     //char temp_buffer[CHUNK_SIZE];
   
@@ -662,10 +665,14 @@ void* producer_thread(void *arg)
         //bool use_compressed = (rand_val < ring->compressed_fraction);
 
         uint8_t temp_buffer[CHUNK_SIZE];
-        ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
+        //ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
+        ssize_t bytes_read = pread(local_fd, temp_buffer, CHUNK_SIZE, my_offset);
         __sync_fetch_and_add(&ring->producer.app_bytes_generated, bytes_read);
 
-        if (bytes_read <= 0) continue;
+        if (bytes_read <= 0) {
+            my_offset = 0;
+            continue;
+        }
 
         uint32_t current_tail, next_tail;
         ring_entry_t *entry;
@@ -959,7 +966,7 @@ void* network_sender_thread(void *arg)
                 } else if (sent > 0) {
                     __sync_fetch_and_add(&ring->network_bytes_out, sent);
                     __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
-                    //INFO_PRINT("PARTIAL SEND REACHED\n");
+                    INFO_PRINT("PARTIAL SEND REACHED\n");
 
                 } else {
                     perror("compressed send failed");
@@ -1014,7 +1021,7 @@ void* network_sender_thread(void *arg)
                     } else {
                         __sync_fetch_and_add(&ring->network_bytes_out, sent);
                         __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
-                        //INFO_PRINT("PARTIAL SEND REACHED\n");
+                        INFO_PRINT("PARTIAL SEND REACHED\n");
 
 
                         //uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
@@ -1330,6 +1337,7 @@ int main(int argc, char *argv[])
         args->ring = ring;
         args->thread_id = i;
         args->core_id = numa_node2_base + i; 
+        args->file_path = input_file;
         
         if (pthread_create(&producer_tids[i], NULL, producer_thread, args) != 0) {
             printf("Failed to create producer thread %d\n", i);
