@@ -217,7 +217,6 @@ void print_ring_status_summary(ring_buffer_t *ring) {
     uint32_t completed = 0;
     uint32_t error = 0;
     uint32_t unknown = 0;
-    uint32_t free = 0;
     uint32_t claimed = 0;
 
     for (uint32_t i = 0; i < RING_SIZE; i++) {
@@ -687,7 +686,6 @@ void* producer_thread(void *arg)
     INFO_PRINT("Producer thread %d started on core %d\n", thread_id, args->core_id);
 
 
-    CpaStatus status;
     uint64_t ring_full_count = 0;
     uint64_t queue_full_count = 0;
     uint64_t qat_backpressure_count = 0;
@@ -853,7 +851,6 @@ void* consumer_thread(void *arg)
     uint64_t stuck_count = 0;
     uint64_t compressed_full = 0;
     uint64_t poll_count = 0;
-    uint64_t empty_count = 0;
         
     while (ring->running) {
         poll_count++;
