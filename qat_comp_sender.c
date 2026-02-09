@@ -987,11 +987,10 @@ void* consumer_thread(void *arg)
 }
 
 /* NETWORK THREAD
-    * if there is data in compressed send queue, send first --> then fallback to
-   uncompressed queue
+    * if there is data in compressed send queue, send first --> then fallback to uncompressed queue
 
 */
-// Re-introducing BATCH_SIZE for Round-Robin scheduling
+// BATCH_SIZE for Round-Robin scheduling
 #define BATCH_SIZE 64
 
 void *network_sender_thread(void *arg) {
@@ -1010,22 +1009,13 @@ void *network_sender_thread(void *arg) {
     bool sent_something = false;
     time_t now = time(NULL);
     if (now - last_report_time >= 5) {
-      uint64_t current_packets =
-          ring->compressed_packets_sent + ring->uncompressed_packets_sent;
-      uint64_t packets_per_sec =
-          (current_packets - last_packets_sent) / (now - last_report_time);
+      uint64_t current_packets = ring->compressed_packets_sent + ring->uncompressed_packets_sent;
+      uint64_t packets_per_sec = (current_packets - last_packets_sent) / (now - last_report_time);
 
       // periodic debugging output
-      DEBUG_PRINT("Network: %lu packets/sec (comp:%lu uncomp:%lu "
-                  "queued_comp:%u queued_uncomp:%u)\n",
-                  packets_per_sec, ring->compressed_packets_sent,
-                  ring->uncompressed_packets_sent,
-                  (ring->compressed_send_queue.tail -
-                   ring->compressed_send_queue.head) &
-                      ring->compressed_send_queue.mask,
-                  (ring->uncompressed_send_queue.tail -
-                   ring->uncompressed_send_queue.head) &
-                      ring->uncompressed_send_queue.mask);
+      DEBUG_PRINT("Network: %lu packets/sec (comp:%lu uncomp:%lu " "queued_comp:%u queued_uncomp:%u)\n", packets_per_sec, ring->compressed_packets_sent,
+                  ring->uncompressed_packets_sent, (ring->compressed_send_queue.tail - ring->compressed_send_queue.head) & ring->compressed_send_queue.mask,
+                  (ring->uncompressed_send_queue.tail - ring->uncompressed_send_queue.head) & ring->uncompressed_send_queue.mask);
 
       last_packets_sent = current_packets;
       last_report_time = now;
@@ -1034,10 +1024,8 @@ void *network_sender_thread(void *arg) {
     // Process COMPRESSED queue
     compressed_send_queue_t *comp_queue = &ring->compressed_send_queue;
     int comp_processed = 0;
-    while (comp_queue->head != comp_queue->tail &&
-           comp_processed < BATCH_SIZE) {
-      compressed_send_entry_t *send_msg =
-          &comp_queue->entries[comp_queue->head];
+    while (comp_queue->head != comp_queue->tail && comp_processed < BATCH_SIZE) {
+      compressed_send_entry_t *send_msg = &comp_queue->entries[comp_queue->head];
       ring_entry_t *entry = send_msg->entry;
 
       if (ring->socket_fd > 0) {
@@ -1047,12 +1035,9 @@ void *network_sender_thread(void *arg) {
         iov[1].iov_base = entry->pDstData;
         iov[1].iov_len = entry->producedSize;
 
-        if (entry->header.magic != MAGIC_COMPRESSED)
-          INFO_PRINT("COMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n",
-                     &entry->header.magic);
+        if (entry->header.magic != MAGIC_COMPRESSED) INFO_PRINT("COMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n",&entry->header.magic);
 
-        ssize_t total_to_send =
-            sizeof(compression_header_t) + entry->producedSize;
+        ssize_t total_to_send = sizeof(compression_header_t) + entry->producedSize;
         ssize_t total_sent = 0;
 
         struct iovec current_iov[2];
@@ -1072,12 +1057,10 @@ void *network_sender_thread(void *arg) {
             if (sent >= current_iov[0].iov_len) {
               size_t overflow = sent - current_iov[0].iov_len;
               current_iov[0].iov_len = 0;
-              current_iov[1].iov_base =
-                  (uint8_t *)current_iov[1].iov_base + overflow;
+              current_iov[1].iov_base = (uint8_t *)current_iov[1].iov_base + overflow;
               current_iov[1].iov_len -= overflow;
             } else {
-              current_iov[0].iov_base =
-                  (uint8_t *)current_iov[0].iov_base + sent;
+              current_iov[0].iov_base = (uint8_t *)current_iov[0].iov_base + sent;
               current_iov[0].iov_len -= sent;
             }
 
@@ -1094,15 +1077,11 @@ void *network_sender_thread(void *arg) {
         if (total_sent == total_to_send) {
           ring->consumer.bytes_sent += entry->producedSize;
           __sync_fetch_and_add(&ring->compressed_packets_sent, 1);
-          __sync_fetch_and_add(&ring->network_bytes_in,
-                               sizeof(compression_header_t) +
-                                   entry->producedSize);
+          __sync_fetch_and_add(&ring->network_bytes_in, sizeof(compression_header_t) + entry->producedSize);
           __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
           sent_entries++;
-          if (sent_entries % 10000 == 0) {
-            DEBUG_PRINT("Network Send Thread: Sent %lu compressed entries\n",
-                        sent_entries);
-          }
+          if (sent_entries % 10000 == 0)  DEBUG_PRINT("Network Send Thread: Sent %lu compressed entries\n", sent_entries);
+          
           sent_something = true;
           comp_processed++;
           comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
@@ -1116,10 +1095,8 @@ void *network_sender_thread(void *arg) {
     // Process UNCOMPRESSED queue (BATCHED)
     uncompressed_send_queue_t *uncomp_queue = &ring->uncompressed_send_queue;
     int uncomp_processed = 0;
-    while (uncomp_queue->head != uncomp_queue->tail &&
-           uncomp_processed < BATCH_SIZE) {
-      uncompressed_send_entry_t *u_entry =
-          &uncomp_queue->entries[uncomp_queue->head];
+    while (uncomp_queue->head != uncomp_queue->tail && uncomp_processed < BATCH_SIZE) {
+      uncompressed_send_entry_t *u_entry = &uncomp_queue->entries[uncomp_queue->head];
 
       if (__atomic_load_n(&u_entry->ready, __ATOMIC_ACQUIRE) == 0) {
         break;
@@ -1131,9 +1108,7 @@ void *network_sender_thread(void *arg) {
         iov[1].iov_base = u_entry->data;
         iov[1].iov_len = u_entry->length;
 
-        if (u_entry->header.magic != MAGIC_UNCOMPRESSED)
-          INFO_PRINT("UNCOMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n",
-                     u_entry->header.magic);
+        if (u_entry->header.magic != MAGIC_UNCOMPRESSED) INFO_PRINT("UNCOMPRESSED PACKET WITH WRONG MAGIC NUMBER!: 0x%08X\n", u_entry->header.magic);
 
         ssize_t total_to_send = u_entry->length + sizeof(compression_header_t);
         ssize_t total_sent = 0;
@@ -1153,20 +1128,17 @@ void *network_sender_thread(void *arg) {
             if (sent >= current_iov[0].iov_len) {
               size_t overflow = sent - current_iov[0].iov_len;
               current_iov[0].iov_len = 0;
-              current_iov[1].iov_base =
-                  (uint8_t *)current_iov[1].iov_base + overflow;
+              current_iov[1].iov_base = (uint8_t *)current_iov[1].iov_base + overflow;
               current_iov[1].iov_len -= overflow;
             } else {
-              current_iov[0].iov_base =
-                  (uint8_t *)current_iov[0].iov_base + sent;
+              current_iov[0].iov_base = (uint8_t *)current_iov[0].iov_base + sent;
               current_iov[0].iov_len -= sent;
             }
           } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             __builtin_ia32_pause();
             continue;
           } else {
-            fprintf(stderr, "Send error (errno=%d): %s\n", errno,
-                    strerror(errno));
+            fprintf(stderr, "Send error (errno=%d): %s\n", errno, strerror(errno));
             break;
           }
         }
@@ -1179,9 +1151,7 @@ void *network_sender_thread(void *arg) {
           sent_something = true;
           uncomp_processed++;
           uncomp_sent_entries++;
-          if (uncomp_sent_entries % 10000 == 0)
-            DEBUG_PRINT("Network Send Thread: Sent %lu uncompressed entries\n",
-                        uncomp_sent_entries);
+          if (uncomp_sent_entries % 10000 == 0) DEBUG_PRINT("Network Send Thread: Sent %lu uncompressed entries\n", uncomp_sent_entries);
           uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
         } else {
           uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
@@ -1191,8 +1161,7 @@ void *network_sender_thread(void *arg) {
 
     if (!sent_something) {
       no_data_counter++;
-      if (no_data_counter % 100000000 == 0)
-        DEBUG_PRINT("Network: No data to send (count: %lu)\n", no_data_counter);
+      if (no_data_counter % 100000000 == 0) DEBUG_PRINT("Network: No data to send (count: %lu)\n", no_data_counter);
       // usleep(10);
     } else {
       no_data_counter = 0;
