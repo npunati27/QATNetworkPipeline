@@ -51,8 +51,7 @@ typedef enum {
     JOB_EMPTY = 0,
     JOB_SUBMITTED = 1,
     JOB_COMPLETED = 2,
-    JOB_ERROR = 3,
-    SLOT_CLAIM = 5
+    JOB_ERROR = 3
 } job_status_t;
 
 //compression benchmark file reader
@@ -211,46 +210,6 @@ typedef struct {
 
 static ring_buffer_t *g_ring = NULL;
 
-void print_ring_status_summary(ring_buffer_t *ring) {
-    uint32_t empty = 0;
-    uint32_t submitted = 0;
-    uint32_t completed = 0;
-    uint32_t error = 0;
-    uint32_t unknown = 0;
-    uint32_t free = 0;
-    uint32_t claimed = 0;
-
-    for (uint32_t i = 0; i < RING_SIZE; i++) {
-        job_status_t status = __atomic_load_n(&ring->entries[i].status, __ATOMIC_ACQUIRE);
-        
-        switch (status) {
-            case JOB_EMPTY:     empty++;     break;
-            case JOB_SUBMITTED: submitted++; break;
-            case JOB_COMPLETED: completed++; break;
-            case JOB_ERROR:     error++;     break;
-            case SLOT_CLAIM:     claimed++;   break;
-            default:            unknown++;   break;
-        }
-    }
-
-    uint32_t head = __atomic_load_n(&ring->consumer.head, __ATOMIC_ACQUIRE);
-    uint32_t tail = __atomic_load_n(&ring->producer.tail, __ATOMIC_ACQUIRE);
-    uint32_t in_flight = (tail - head) & ring->mask;
-
-    DEBUG_PRINT("\n--- Ring Buffer Snapshot ---\n");
-    DEBUG_PRINT("  [EMPTY]     : %u\n", empty);
-    DEBUG_PRINT("  [SUBMITTED] : %u (Pending QAT Hardware)\n", submitted);
-    DEBUG_PRINT("  [COMPLETED] : %u (Waiting for Consumer/Network)\n", completed);
-    DEBUG_PRINT("  [ERROR]     : %u (Waiting for Consumer Cleanup)\n", error);
-    DEBUG_PRINT("  [CLAIM]     : %u (Waiting for Consumer Cleanup)\n", claimed);
-    if (unknown > 0) printf("  [UNKNOWN!!] : %u\n", unknown);
-    DEBUG_PRINT("----------------------------\n");
-    DEBUG_PRINT("  Pointer Logic: Head=%u, Tail=%u (Occupancy: %u/%d)\n", 
-            head, tail, in_flight, RING_SIZE);
-    ring_entry_t *entry = &ring->entries[head];
-    DEBUG_PRINT("Head STATUS: %d\n", entry->status);    
-}
-
 //ensure each thread is pinned to different cores (on same NUMA node)
 int pin_thread_to_core(int core_id) {
     cpu_set_t cpuset;
@@ -406,7 +365,9 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
         entry->header.compressed_size = entry->producedSize;
         entry->header.checksum = 0;
         
-        __atomic_store_n(&entry->status, JOB_COMPLETED, __ATOMIC_RELEASE);
+        __sync_synchronize();
+        entry->status = JOB_COMPLETED;
+        __sync_synchronize();
         
         if (callback_count % 100000 == 0) {
             DEBUG_PRINT("Callback: %lu successful compressions\n", callback_count);
@@ -706,6 +667,7 @@ void* producer_thread(void *arg)
         uint8_t temp_buffer[CHUNK_SIZE];
         //ssize_t bytes_read = read_chunk_from_files(&ring->file_reader, temp_buffer, CHUNK_SIZE);
         ssize_t bytes_read = pread(local_fd, temp_buffer, CHUNK_SIZE, my_offset);
+        __sync_fetch_and_add(&ring->producer.app_bytes_generated, bytes_read);
 
         if (bytes_read <= 0) {
             my_offset = 0;
@@ -721,17 +683,9 @@ void* producer_thread(void *arg)
 
         if (next_tail != __atomic_load_n(&ring->consumer.head, __ATOMIC_ACQUIRE) &&
             __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE) == JOB_EMPTY) {
-            //INFO_PRINT("REACHED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-            // if (__atomic_compare_exchange_n(&ring->producer.tail, &current_tail, next_tail,
-            //                                false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
-            //     ring_claimed = true;
-            // }
-            if (__atomic_compare_exchange_n(&entry->status, 
-                                &(job_status_t){JOB_EMPTY}, 
-                                SLOT_CLAIM,
-                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        
-                __atomic_store_n(&ring->producer.tail, next_tail, __ATOMIC_RELEASE);
+            
+            if (__atomic_compare_exchange_n(&ring->producer.tail, &current_tail, next_tail,
+                                           false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
                 ring_claimed = true;
             }
         }
@@ -770,7 +724,6 @@ void* producer_thread(void *arg)
                 }
                 __atomic_store_n(&entry->status, JOB_SUBMITTED, __ATOMIC_RELEASE);
                 __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
-                __sync_fetch_and_add(&ring->producer.app_bytes_generated, bytes_read);
                 bytes_generated += bytes_read;
                 packets_generated++;
                 continue;
@@ -805,11 +758,9 @@ void* producer_thread(void *arg)
                 u_entry->header.algorithm = 99;
                 __atomic_store_n(&u_entry->ready, 1, __ATOMIC_RELEASE);
                 
-                //__sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
-                __sync_fetch_and_add(&ring->producer.app_bytes_generated, bytes_read);
+                __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
                 bytes_generated += bytes_read;
                 packets_generated++;
-
             }
         } else {
             queue_full_count++;
@@ -824,9 +775,6 @@ void* producer_thread(void *arg)
           
             bytes_generated = 0;
             packets_generated = 0;
-            ring_full_count = 0;
-            qat_backpressure_count = 0;
-            queue_full_count = 0;
             last_report = now;
         }
     }
@@ -846,14 +794,12 @@ void* consumer_thread(void *arg)
     ring_buffer_t *ring = args->ring;
     int thread_id = args->thread_id;
     pin_thread_to_core(args->core_id);
-    //bool stuck_reached = false; 
     INFO_PRINT("Consumer thread %d started on core %d\n", thread_id, args->core_id);
 
     uint64_t send_count = 0;
     uint64_t stuck_count = 0;
     uint64_t compressed_full = 0;
     uint64_t poll_count = 0;
-    uint64_t empty_count = 0;
         
     while (ring->running) {
         poll_count++;
@@ -864,18 +810,14 @@ void* consumer_thread(void *arg)
                 INFO_PRINT("Consumer: Poll failed with status %d\n", poll_status);
             }
         }
-        // if(poll_count % 100000000 == 0) {
-        //     DEBUG_PRINT("Consumer: Polled %lu times...\n", poll_count);
-        // }
+        if(poll_count % 100000000 == 0) {
+            DEBUG_PRINT("Consumer: Polled %lu times...\n", poll_count);
+        }
         
         uint32_t current_head = ring->consumer.head;
         ring_entry_t *entry = &ring->entries[current_head];
         job_status_t current_status = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
-
-        if(poll_count % 100000000 == 0) {
-            DEBUG_PRINT("Consumer: Polled %lu times...\n", poll_count);
-            DEBUG_PRINT("Consumer: HEAD STATUS: %d\n", current_status);
-        }
+        
         if (current_status == JOB_COMPLETED) {
             //current head is completed
             stuck_count = 0;
@@ -899,11 +841,8 @@ void* consumer_thread(void *arg)
                 }
 
                 //after a while change the status to empty and move to next compressed send queue entry
-                // ring->consumer.head = (current_head + 1) & ring->mask;
-                uint32_t next_head = (current_head + 1) & ring->mask;
-                __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
-
                 __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+                ring->consumer.head = (current_head + 1) & ring->mask;
 
                 continue;
             }
@@ -915,8 +854,7 @@ void* consumer_thread(void *arg)
             //mark job as empty after its complete and advance head
             //__atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
             ring->consumer.jobs_sent++;
-            uint32_t next_head = (current_head + 1) & ring->mask;
-            __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
+            ring->consumer.head = (current_head + 1) & ring->mask;
             
             send_count++;
             if (send_count % 10000 == 0) {
@@ -926,8 +864,7 @@ void* consumer_thread(void *arg)
         } else if (current_status == JOB_ERROR) {
             //job is error state, change it emoty and advance head
             __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
-            uint32_t next_head = (current_head + 1) & ring->mask;
-            __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
+            ring->consumer.head = (current_head + 1) & ring->mask; 
             stuck_count = 0;
             //INFO_PRINT("Consumer: JOB %lu STUCK IN ERROR\n", entry->sequence_number);
             // INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
@@ -935,50 +872,20 @@ void* consumer_thread(void *arg)
         } else if (current_status == JOB_SUBMITTED) {
             //job is stuck in submitted..
             stuck_count++;
-            
             if(stuck_count % 1000000 == 0) {
                 // INFO_PRINT("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
                 // INFO_PRINT("  Forcing to ERROR state and skipping...\n");
                 // entry->status = JOB_EMPTY;
                 // ring->consumer.head = (current_head + 1) & ring->mask;
                 // stuck_count = 0;
-                INFO_PRINT("Consumer: JOB %lu STUCK IN SUBMITTED %lu times\n",entry->sequence_number, stuck_count);
-                // INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
-                        // entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
-                __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
-                uint32_t next_head = (current_head + 1) & ring->mask;
-                __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
+                INFO_PRINT("Consumer: JOB STUCK IN SUBMITTED %lu times\n", stuck_count);
+                INFO_PRINT("  Entry details: seq=%lu, srcSize=%u, dstSize=%u\n", 
+                        entry->sequence_number, entry->srcDataSize, entry->dstDataSize);
                 // entry->status = JOB_EMPTY;
                 // ring->consumer.head = (current_head + 1) & ring->mask;
                 // stuck_count = 0;
 
             } 
-        } else if(current_status == JOB_EMPTY) {
-            // uint32_t tail = __atomic_load_n(&ring->producer.tail, __ATOMIC_ACQUIRE);
-            // uint32_t occupancy = (tail - current_head) & ring->mask;
-
-            // empty_count++;
-            // if(empty_count % 1000000 == 0) {
-            //     uint32_t next_head = (current_head + 1) & ring->mask;
-            //     __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
-            //     INFO_PRINT("Consumer: Mitigated leaked slot at %u\n", current_head);
-            // }
-            uint32_t next_head = (current_head + 1) & ring->mask;
-            __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
-
-            // // Is the ring mathematically full? (e.g., 10239/10240)
-            // if (occupancy >= (ring->mask - 10)) {
-            //     // We have a deadlock. A producer claimed this but never filled it.
-            //     // We MUST advance to keep the 40Gbps flow alive.
-            //     uint32_t next_head = (current_head + 1) & ring->mask;
-            //     __atomic_store_n(&ring->consumer.head, next_head, __ATOMIC_RELEASE);
-                
-            //     // Log this! If this happens a lot, your producer logic has a bug.
-            //     static uint64_t leaks = 0;
-            //     if (leaks++ % 100 == 0) INFO_PRINT("Consumer: Mitigated leaked slot at %u\n", current_head);
-            // }
-        } else if(current_status == SLOT_CLAIM){
-            continue;
         }
     }
     
@@ -1080,7 +987,7 @@ void *network_sender_thread(void *arg) {
           sent_something = true;
           comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
         } else {
-          __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+          entry->status = JOB_EMPTY;
           comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
         }
       } 
@@ -1539,8 +1446,6 @@ int main(int argc, char *argv[])
     print_qat_stats(ring, elapsed_sec);
     INFO_PRINT("  Compressed packets: %lu\n", ring->compressed_packets_sent);
     INFO_PRINT("  Uncompressed packets: %lu\n", ring->uncompressed_packets_sent);
-    print_ring_status_summary(ring);
-
     // printf("  Jobs submitted: %lu\n", ring->producer.jobs_submitted);
     // printf("  Jobs sent: %lu\n", ring->consumer.jobs_sent);
     // printf("  Bytes sent: %lu\n", ring->consumer.bytes_sent);
