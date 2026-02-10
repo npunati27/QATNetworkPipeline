@@ -33,8 +33,8 @@
 #define MAX_BUFFER_SIZE 128 * 1024  
 #define SAMPLE_SIZE 256
 #define SEND_QUEUE_SIZE 128 * 1024   //128
-#define NUM_PRODUCERS 4
-#define PRODUCERS_PER_INSTANCE 2
+#define NUM_PRODUCERS 8
+#define PRODUCERS_PER_INSTANCE 4
 #define NUM_QAT_INSTANCES 2
 #define NUM_CONSUMERS 2
 #define NUM_SENDERS 1
@@ -317,7 +317,7 @@ void qat_dc_callback(void *pCallbackTag, CpaStatus status)
 }
 
 /* Initialize QAT
-    * Find instance on NUMA Node 2
+    * Distribute instances across NUMA nodes for better parallelism
     * Set up Address Translation for DMA
     * Set up session data (algorithm, level, etc)
 */
@@ -349,57 +349,135 @@ int qat_init(ring_buffer_t *ring, int instance_target_index)
         return -1;
     }
 
-    int target_numa_node = 2;  
+    // Strategy: Alternate between NUMA nodes for each ring buffer
+    // Ring 0 -> NUMA node 2, Ring 1 -> NUMA node 3, Ring 2 -> NUMA node 2, etc.
+    int target_numa_nodes[] = {2, 3};  // Alternate between these NUMA nodes
+    int target_numa_node = target_numa_nodes[instance_target_index % 2];
+    
     int selected_instance = -1;
     int instances_on_numa[16] = {0};
     int numa_instance_count = 0;
 
-    // First pass: find all instances on target NUMA node
+    // First pass: find all instances on target NUMA node and collect their info
+    CpaInstanceInfo2 numa_info[16];
     for (int i = 0; i < numInstances; i++) {
         CpaInstanceInfo2 info;
         status = cpaDcInstanceGetInfo2(instances[i], &info);
         
         if (status == CPA_STATUS_SUCCESS) {
-            DEBUG_PRINT("Instance %d: nodeAffinity = %d\n", i, info.nodeAffinity);
+            DEBUG_PRINT("Instance %d: nodeAffinity=%d, packageId=%u, accelId=%u, execEngineId=%u\n", 
+                       i, info.nodeAffinity,
+                       info.physInstId.packageId,
+                       info.physInstId.acceleratorId,
+                       info.physInstId.executionEngineId);
             
             if (info.nodeAffinity == target_numa_node) {
-                instances_on_numa[numa_instance_count++] = i;
+                instances_on_numa[numa_instance_count] = i;
+                numa_info[numa_instance_count] = info;
+                numa_instance_count++;
             }
         }
     }
 
     // Find an unused instance on the target NUMA node
     if (numa_instance_count == 0) {
-        // Fallback: no instances on target NUMA, find any unused instance
+        // Fallback: try the other NUMA node
+        int fallback_numa = target_numa_nodes[(instance_target_index + 1) % 2];
+        INFO_PRINT("Warning: No QAT on NUMA %d, trying NUMA %d\n", 
+                   target_numa_node, fallback_numa);
+        
+        numa_instance_count = 0;
         for (int i = 0; i < numInstances; i++) {
-            if (!g_state->qat_instances_used[i]) {
-                selected_instance = i;
-                INFO_PRINT("Warning: No QAT on NUMA %d, using instance %d from different NUMA\n", 
-                           target_numa_node, selected_instance);
+            CpaInstanceInfo2 info;
+            status = cpaDcInstanceGetInfo2(instances[i], &info);
+            
+            if (status == CPA_STATUS_SUCCESS && info.nodeAffinity == fallback_numa) {
+                instances_on_numa[numa_instance_count] = i;
+                numa_info[numa_instance_count] = info;
+                numa_instance_count++;
+            }
+        }
+        
+        target_numa_node = fallback_numa;
+        
+        if (numa_instance_count == 0) {
+            // Last resort: find any unused instance
+            for (int i = 0; i < numInstances; i++) {
+                if (!g_state->qat_instances_used[i]) {
+                    selected_instance = i;
+                    CpaInstanceInfo2 info;
+                    cpaDcInstanceGetInfo2(instances[i], &info);
+                    INFO_PRINT("Warning: Using instance %d from NUMA %d\n", 
+                               selected_instance, info.nodeAffinity);
+                    break;
+                }
+            }
+            
+            if (selected_instance == -1) {
+                printf("Error: All QAT instances are already in use\n");
+                free(instances);
+                return -1;
+            }
+        }
+    }
+    
+    // Find unused instance, preferring different physical packages
+    if (selected_instance == -1) {
+        bool found = false;
+        
+        // Try to find instance on different physical package than already used
+        for (int i = 0; i < numa_instance_count; i++) {
+            int logical_id = instances_on_numa[i];
+            Cpa32U package_id = numa_info[i].physInstId.packageId;
+            
+            // Check if already used
+            if (g_state->qat_instances_used[logical_id]) {
+                DEBUG_PRINT("Instance %d already used, skipping\n", logical_id);
+                continue;
+            }
+            
+            // Check if this package ID conflicts with already selected instances
+            bool package_conflict = false;
+            for (int j = 0; j < instance_target_index; j++) {
+                if (g_state->rings[j] != NULL) {
+                    CpaInstanceInfo2 existing_info;
+                    cpaDcInstanceGetInfo2(g_state->rings[j]->dcInstance, &existing_info);
+                    
+                    if (existing_info.physInstId.packageId == package_id) {
+                        DEBUG_PRINT("Instance %d (package %u) conflicts with ring %d, skipping\n",
+                                   logical_id, package_id, j);
+                        package_conflict = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (!package_conflict) {
+                selected_instance = logical_id;
+                found = true;
+                INFO_PRINT("Ring %d: Selected instance %d on NUMA %d (package=%u, accel=%u, engine=%u)\n",
+                          instance_target_index, selected_instance, target_numa_node,
+                          numa_info[i].physInstId.packageId,
+                          numa_info[i].physInstId.acceleratorId,
+                          numa_info[i].physInstId.executionEngineId);
                 break;
+            }
+        }
+        
+        // Fallback: use any available instance on this NUMA node
+        if (!found) {
+            for (int i = 0; i < numa_instance_count; i++) {
+                int logical_id = instances_on_numa[i];
+                if (!g_state->qat_instances_used[logical_id]) {
+                    selected_instance = logical_id;
+                    INFO_PRINT("Ring %d: Using instance %d on NUMA %d (may share physical package)\n",
+                              instance_target_index, selected_instance, target_numa_node);
+                    break;
+                }
             }
         }
         
         if (selected_instance == -1) {
-            printf("Error: All QAT instances are already in use\n");
-            free(instances);
-            return -1;
-        }
-    } else {
-        // Find an unused instance on target NUMA node
-        bool found = false;
-        for (int i = 0; i < numa_instance_count; i++) {
-            int instance_id = instances_on_numa[i];
-            if (!g_state->qat_instances_used[instance_id]) {
-                selected_instance = instance_id;
-                found = true;
-                INFO_PRINT("Selected QAT instance %d (NUMA-local instance #%d) on NUMA node %d\n", 
-                           selected_instance, i, target_numa_node);
-                break;
-            }
-        }
-        
-        if (!found) {
             printf("Error: All QAT instances on NUMA %d are already in use\n", target_numa_node);
             free(instances);
             return -1;
@@ -408,12 +486,21 @@ int qat_init(ring_buffer_t *ring, int instance_target_index)
     
     // Mark this instance as used
     g_state->qat_instances_used[selected_instance] = true;
-    g_state->qat_instances_used[selected_instance + 1] = true;
     
     ring->dcInstance = instances[selected_instance];
     ring->instance_id = instance_target_index;
+    
+    // Print detailed info about selected instance
+    CpaInstanceInfo2 selected_info;
+    cpaDcInstanceGetInfo2(ring->dcInstance, &selected_info);
+    INFO_PRINT("Ring %d: Physical mapping - NUMA=%d, Package=%u, Accelerator=%u, ExecEngine=%u\n",
+              instance_target_index,
+              selected_info.nodeAffinity,
+              selected_info.physInstId.packageId,
+              selected_info.physInstId.acceleratorId,
+              selected_info.physInstId.executionEngineId);
+    
     free(instances);
-
 
     status = cpaDcSetAddressTranslation(ring->dcInstance, qaeVirtToPhysNUMA);
     if (status != CPA_STATUS_SUCCESS) {
@@ -421,7 +508,7 @@ int qat_init(ring_buffer_t *ring, int instance_target_index)
         return -1;
     }
     
-    Cpa16U numBuffers = 2048; 
+    Cpa16U numBuffers = 4096;  // Increased from 2048 for better throughput
     status = cpaDcStartInstance(ring->dcInstance, numBuffers, NULL);
     if (status != CPA_STATUS_SUCCESS) {
         printf("Failed to start DC instance: %d\n", status);
@@ -441,22 +528,15 @@ int qat_init(ring_buffer_t *ring, int instance_target_index)
         case 9: qat_level = CPA_DC_L9; break;
         default: qat_level = CPA_DC_L1;
     } 
-
     
     ring->sessionSetupData.compLevel = qat_level;            
-    ring->sessionSetupData.compType = CPA_DC_DEFLATE;          // DEFLATE
-    ring->sessionSetupData.huffType = CPA_DC_HT_STATIC;        //static huffman
+    ring->sessionSetupData.compType = CPA_DC_DEFLATE;
+    ring->sessionSetupData.huffType = CPA_DC_HT_STATIC;
     ring->sessionSetupData.autoSelectBestHuffmanTree = CPA_FALSE;
     ring->sessionSetupData.sessDirection = CPA_DC_DIR_COMPRESS;
     ring->sessionSetupData.sessState = CPA_DC_STATELESS;       
     ring->sessionSetupData.checksum = CPA_DC_CRC32;
     ring->sessionSetupData.windowSize = 15;       
-    
-    // ring->sessionSetupData.compLevel = qat_level;              
-    // ring->sessionSetupData.compType = CPA_DC_LZ4;              // config for LZ4
-    // ring->sessionSetupData.sessDirection = CPA_DC_DIR_COMPRESS;
-    // ring->sessionSetupData.sessState = CPA_DC_STATELESS;       
-    // ring->sessionSetupData.checksum = CPA_DC_NONE;   
     
     status = cpaDcGetSessionSize(ring->dcInstance, 
                                  &ring->sessionSetupData,
@@ -936,12 +1016,22 @@ bool try_send_compressed(ring_buffer_t *ring, int socket_fd, uint64_t *counter) 
     compressed_send_entry_t *send_msg = &comp_queue->entries[comp_queue->head];
     ring_entry_t *entry = send_msg->entry;
 
+    job_status_t current_status = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
+    if (current_status != JOB_COMPLETED) {
+        comp_queue->head = (comp_queue->head + 1) & comp_queue->mask;
+        return false;
+    }
+
     if (socket_fd > 0) {
         struct iovec iov[2];
         iov[0].iov_base = &entry->header;
         iov[0].iov_len = sizeof(compression_header_t);
         iov[1].iov_base = entry->pDstData;
         iov[1].iov_len = entry->producedSize;
+
+        if(entry->header.magic != MAGIC_COMPRESSED) {
+            INFO_PRINT("ERROR MAGIC COMPRESSED: Ring %d\n", ring->instance_id);
+        }
 
         ssize_t total_to_send = sizeof(compression_header_t) + entry->producedSize;
         ssize_t total_sent = 0;
@@ -1015,6 +1105,9 @@ bool try_send_uncompressed(ring_buffer_t *ring, int socket_fd, uint64_t *counter
         iov[0].iov_len = sizeof(compression_header_t);
         iov[1].iov_base = u_entry->data;
         iov[1].iov_len = u_entry->length;
+        if(u_entry->header.magic != MAGIC_UNCOMPRESSED) {
+            INFO_PRINT("ERROR MAGIC UNCOMPRESSED: Ring %d\n", ring->instance_id);
+        }
 
         ssize_t total_to_send = u_entry->length + sizeof(compression_header_t);
         ssize_t total_sent = 0;
@@ -1055,9 +1148,11 @@ bool try_send_uncompressed(ring_buffer_t *ring, int socket_fd, uint64_t *counter
             __sync_fetch_and_add(counter, 1);
             __sync_fetch_and_add(&ring->uncompressed_packets_sent, 1);
             __sync_fetch_and_add(&ring->network_bytes_in, u_entry->length);
+            __atomic_store_n(&u_entry->ready, 0, __ATOMIC_RELEASE);
             uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
             return true;
         } else {
+            __atomic_store_n(&u_entry->ready, 0, __ATOMIC_RELEASE);
             uncomp_queue->head = (uncomp_queue->head + 1) & uncomp_queue->mask;
             return false;
         }
@@ -1071,6 +1166,8 @@ bool try_send_uncompressed(ring_buffer_t *ring, int socket_fd, uint64_t *counter
     * if there is data in compressed send queue, send first --> then fallback to uncompressed queue
 
 */
+#define BATCH_SIZE 128
+
 void *network_sender_thread(void *arg) {
     thread_args_t *args = (thread_args_t *)arg;
     pin_thread_to_core(args->core_id);
@@ -1105,29 +1202,61 @@ void *network_sender_thread(void *arg) {
             last_report_time = now;
         }
 
-        // Priority 1: Ring 0 - Compressed queue
+        //ring 0 - compressed queue
         if (try_send_compressed(ring0, g_state->socket_fd, &total_compressed)) {
             sent_something = true;
             continue;
         }
 
-        // Priority 2: Ring 1 - Compressed queue  
+        // ring 1 - compressed queue  
         if (try_send_compressed(ring1, g_state->socket_fd, &total_compressed)) {
             sent_something = true;
             continue;
         }
 
-        // Priority 3: Ring 0 - Uncompressed queue
+        // ring 0 - uncompressed queue
         if (try_send_uncompressed(ring0, g_state->socket_fd, &total_uncompressed)) {
             sent_something = true;
             continue;
         }
 
-        // Priority 4: Ring 1 - Uncompressed queue
+        // ring 1 - uncompressed queue
         if (try_send_uncompressed(ring1, g_state->socket_fd, &total_uncompressed)) {
             sent_something = true;
             continue;
         }
+
+        // for (int i = 0; i < BATCH_SIZE; i++) {
+        //     if (try_send_compressed(ring0, g_state->socket_fd, &total_compressed)) {
+        //         sent_something = true;
+        //     } else {
+        //         break; // Queue empty or send failed
+        //     }
+        // }
+
+        // for (int i = 0; i < BATCH_SIZE; i++) {
+        //     if (try_send_compressed(ring1, g_state->socket_fd, &total_compressed)) {
+        //         sent_something = true;
+        //     } else {
+        //         break; // Queue empty or send failed
+        //     }
+        // }
+
+        // for (int i = 0; i < BATCH_SIZE; i++) {
+        //     if (try_send_uncompressed(ring0, g_state->socket_fd, &total_uncompressed)) {
+        //         sent_something = true;
+        //     } else {
+        //         break; // Queue empty or send failed
+        //     }
+        // }
+
+        // for (int i = 0; i < BATCH_SIZE; i++) {
+        //     if (try_send_uncompressed(ring1, g_state->socket_fd, &total_uncompressed)) {
+        //         sent_something = true;
+        //     } else {
+        //         break; // Queue empty or send failed
+        //     }
+        // }
 
         if (!sent_something) {
             no_data_counter++;
@@ -1324,39 +1453,6 @@ int setup_server_socket(int port)
     close(sockfd); 
     return client_fd;
 }
-
-
-//print qat_stats
-// void print_qat_stats(double elapsed_sec)
-// {
-//     uint64_t total_compressions = 0;
-//     uint64_t total_bytes_in = 0;
-//     uint64_t total_bytes_out = 0;
-    
-//     // Aggregate stats from all QAT instances
-//     for (int i = 0; i < NUM_QAT_INSTANCES; i++) {
-//         ring_buffer_t *ring = g_state->rings[i];
-//         total_compressions += ring->qat_stats.total_compressions;
-//         total_bytes_in += ring->qat_stats.total_bytes_in;
-//         total_bytes_out += ring->qat_stats.total_bytes_out;
-//     }
-    
-//     if (total_compressions > 0) {
-//         double net_in_gbps = (total_bytes_in * 8.0) / (elapsed_sec * 1e9);
-//         double net_out_gbps = (total_bytes_out * 8.0) / (elapsed_sec * 1e9);
-//         double compression_ratio = (double)total_bytes_out / (double)total_bytes_in;
-
-//         INFO_PRINT("Aggregated QAT Stats (All Instances):\n");
-//         INFO_PRINT("  Total Compressions: %lu\n", total_compressions);
-//         INFO_PRINT("  TX QAT Bytes In:  %lu --> Throughput: %.2f Gbps\n", 
-//                    total_bytes_in, net_in_gbps);
-//         INFO_PRINT("  TX QAT Bytes Out: %lu --> Throughput: %.2f Gbps\n", 
-//                    total_bytes_out, net_out_gbps);
-//         INFO_PRINT("  Compression Ratio: %.2f%%\n", compression_ratio * 100);
-//     } else {
-//         INFO_PRINT("Aggregated QAT Stats: No compressions recorded\n");
-//     }
-// }
 
 void print_qat_stats(double elapsed_sec)
 {
