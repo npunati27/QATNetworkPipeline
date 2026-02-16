@@ -30,9 +30,9 @@
 #define MAX_BUFFER_SIZE 128 * 1024
 #define SAMPLE_SIZE 256
 #define SEND_QUEUE_SIZE 128 * 1024 // 128
-#define NUM_PRODUCERS 12
+#define NUM_PRODUCERS 8
 #define NUM_CONSUMERS 1
-#define NUM_SENDERS 6
+#define NUM_SENDERS 4
 #define MAGIC_COMPRESSED 0x51415443
 #define MAGIC_UNCOMPRESSED 0x51415452
 
@@ -763,6 +763,7 @@ void *producer_thread(void *arg) {
     next_tail = (current_tail + 1) & ring->mask;
     entry = &ring->entries[current_tail];
 
+    //if (use_compressed &&
     if (next_tail != __atomic_load_n(&ring->consumer.head, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE) == JOB_EMPTY) {
       // INFO_PRINT("REACHED!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");

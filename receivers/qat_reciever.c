@@ -21,7 +21,7 @@
 #define MAGIC_UNCOMPRESSED 0x51415452
 #define MAX_BUFFER_SIZE 131072
 #define RING_SIZE 16384
-#define NUM_RECEIVERS 6
+#define NUM_RECEIVERS 4
 #define CACHE_LINE_SIZE 64
 
 static volatile bool g_shutdown_requested = false;
