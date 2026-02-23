@@ -37,9 +37,9 @@ typedef struct {
 
 typedef enum {
     JOB_EMPTY = 0,
-    JOB_READY = 1,      // Received from network, ready to submit to QAT
-    JOB_SUBMITTED = 2,  // Submitted to QAT, waiting for callback
-    JOB_COMPLETED = 3,  // QAT callback completed
+    JOB_READY = 1,      
+    JOB_SUBMITTED = 2,  
+    JOB_COMPLETED = 3,  
     JOB_ERROR = 4
 } job_status_t; 
 
@@ -73,14 +73,13 @@ typedef struct {
         volatile uint32_t tail;
         uint64_t packets_received;
         uint64_t bytes_received;
-        // uint64_t compressed_packets;
-        // uint64_t uncompressed_packets;
         uint64_t jobs_submitted;
-        char pad[CACHE_LINE_SIZE - 48];
+        char pad[CACHE_LINE_SIZE - 24];
     } __attribute__((aligned(CACHE_LINE_SIZE))) producer;
     
     struct {
-        volatile uint32_t head;
+        volatile uint32_t submit_head;   
+        volatile uint32_t complete_head; 
         uint64_t jobs_completed;
         uint64_t jobs_processed;
         char pad[CACHE_LINE_SIZE - 24];
@@ -103,6 +102,7 @@ typedef struct {
     struct timeval start_time;
     struct {
         uint64_t total_bytes_in;
+        uint64_t total_bytes_in_before;
         uint64_t total_bytes_out;
     } qat_stats;
 } ring_buffer_t;
@@ -123,13 +123,12 @@ void decompress_callback(void *pCallbackTag, CpaStatus status)
     
     if (status == CPA_STATUS_SUCCESS) {
         entry->producedSize = entry->dcResults.produced;
-        __sync_synchronize();
-        entry->status = JOB_COMPLETED;
         __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_in, entry->srcDataSize);
         __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_out, entry->producedSize);
+        // Store COMPLETED last so the collect loop sees a consistent entry
+        __atomic_store_n(&entry->status, JOB_COMPLETED, __ATOMIC_RELEASE);
     } else {
-        __sync_synchronize();
-        entry->status = JOB_ERROR;
+        __atomic_store_n(&entry->status, JOB_ERROR, __ATOMIC_RELEASE);
     }
     
     entry->complete_time = clock();
@@ -229,7 +228,7 @@ int qat_init(ring_buffer_t *ring, int compression_level)
     status = cpaDcSetAddressTranslation(ring->dcInstance, qaeVirtToPhysNUMA);
     if (status != CPA_STATUS_SUCCESS) return -1;
     
-    status = cpaDcStartInstance(ring->dcInstance, 512, NULL);
+    status = cpaDcStartInstance(ring->dcInstance, 4096, NULL);
     if (status != CPA_STATUS_SUCCESS) return -1;
     
     CpaDcCompLvl qat_level = CPA_DC_L6;
@@ -240,12 +239,6 @@ int qat_init(ring_buffer_t *ring, int compression_level)
     sessionSetupData.sessDirection = CPA_DC_DIR_DECOMPRESS;
     sessionSetupData.sessState = CPA_DC_STATELESS;
     sessionSetupData.checksum = CPA_DC_CRC32;
-
-    // sessionSetupData.compLevel = qat_level;              // Compression level
-    // sessionSetupData.compType = CPA_DC_LZ4;              // LZ4 compression
-    // sessionSetupData.sessDirection = CPA_DC_DIR_DECOMPRESS;
-    // sessionSetupData.sessState = CPA_DC_STATELESS;       
-    // sessionSetupData.checksum = CPA_DC_NONE; 
     
     status = cpaDcGetSessionSize(ring->dcInstance, &sessionSetupData,
                                  &sessionSize, &contextSize);
@@ -279,7 +272,6 @@ ring_buffer_t* ring_buffer_init(int compression_level)
         return NULL;
     }
     
-    // Pre-allocate all buffers in the ring
     for (int i = 0; i < RING_SIZE; i++) {
         ring->entries[i].status = JOB_EMPTY;
         if (allocate_qat_buffers(&ring->entries[i], ring->dcInstance) != 0) {
@@ -324,26 +316,24 @@ void* network_thread(void *arg)
     printf("Network thread started\n");
     
     while (g_ring->running) {
-        //don't peek first 4 bytes, read the entire compression header (both compressed + uncompressed packets have it)
         if (recv_exact(sockfd, &header, sizeof(compression_header_t)) < 0) {
             printf("Connection closed or error reading header\n");
             break;
         }
 
         if (header.magic == MAGIC_COMPRESSED) {
-            // compressed path
-            uint32_t current_tail = g_ring->producer.tail;
+            uint32_t current_tail = __atomic_load_n(&g_ring->producer.tail, __ATOMIC_ACQUIRE);
             uint32_t next_tail = (current_tail + 1) & g_ring->mask;
             
-            if (next_tail == g_ring->consumer.head) {
-                // drain if no space in ring buffer -> this is why qat bytes don't align on RX and TX
+            if (next_tail == __atomic_load_n(&g_ring->consumer.complete_head, __ATOMIC_ACQUIRE)) {
                 if (recv_exact(sockfd, temp_buffer, header.compressed_size) < 0) {
                     printf("Error draining compressed data\n");
                     break;
                 }
                 __sync_fetch_and_add(&g_ring->ring_full_count, 1);
                 __sync_fetch_and_add(&g_ring->compressed_packets_recv, 1);
-                __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+                __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_in_before, header.compressed_size);
+                __sync_fetch_and_add(&g_ring->producer.bytes_received,
                                 sizeof(compression_header_t) + header.compressed_size);
                 continue;
             }
@@ -359,17 +349,18 @@ void* network_thread(void *arg)
             
             entry->srcDataSize = header.compressed_size;
             entry->pFlatSrcBuffer->dataLenInBytes = header.compressed_size;
+            entry->pFlatDstBuffer->dataLenInBytes = MAX_BUFFER_SIZE * 2;
             entry->sequence_number = header.sequence_number;
-            entry->status = JOB_READY; 
-            
-            __sync_synchronize();
-            g_ring->producer.tail = next_tail;
+
+            __atomic_store_n(&entry->status, JOB_READY, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_ring->producer.tail, next_tail, __ATOMIC_RELEASE);
+
             __sync_fetch_and_add(&g_ring->compressed_packets_recv, 1);
-            __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+            __sync_fetch_and_add(&g_ring->qat_stats.total_bytes_in_before, header.compressed_size);
+            __sync_fetch_and_add(&g_ring->producer.bytes_received,
                                 sizeof(compression_header_t) + header.compressed_size);
 
         } else if (header.magic == MAGIC_UNCOMPRESSED) {
-            // uncompressed path 
             if (recv_exact(sockfd, temp_buffer, header.uncompressed_size) < 0) {
                 printf("Error reading uncompressed data\n");
                 break;
@@ -377,7 +368,7 @@ void* network_thread(void *arg)
 
             __sync_fetch_and_add(&g_ring->uncompressed_packets_recv, 1);
             __sync_fetch_and_add(&g_ring->uncompressed_bytes, header.uncompressed_size);
-            __sync_fetch_and_add(&g_ring->producer.bytes_received, 
+            __sync_fetch_and_add(&g_ring->producer.bytes_received,
                                 sizeof(compression_header_t) + header.uncompressed_size);
                                 
         } else {
@@ -394,88 +385,117 @@ void* network_thread(void *arg)
     return NULL;
 }
 
-
 void* decompress_thread(void *arg)
 {
     ring_buffer_t *ring = (ring_buffer_t*)arg;
     uint64_t completed_count = 0;
     uint64_t submit_count = 0;
     uint64_t retry_count = 0;
-    uint64_t poll_count = 0;
     
-    printf("Decompress thread started\n");
+    printf("Decompress thread started (pipelined mode)\n");
     
     while (ring->running && !g_shutdown_requested) {
-        poll_count++;
         icp_sal_DcPollInstance(ring->dcInstance, 64);
-        
-        uint32_t current_head = ring->consumer.head;
-        ring_entry_t *entry = &ring->entries[current_head];
-        job_status_t current_status = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
-        
-        if (current_status == JOB_READY) {
+
+        while (true) {
+            uint32_t sh = __atomic_load_n(&ring->consumer.submit_head, __ATOMIC_ACQUIRE);
+            uint32_t tail = __atomic_load_n(&ring->producer.tail, __ATOMIC_ACQUIRE);
+
+            if (sh == tail) break; 
+
+            ring_entry_t *entry = &ring->entries[sh];
+            job_status_t s = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
+
+            if (s != JOB_READY) break; 
+
             CpaDcOpData opData = {0};
             opData.flushFlag = CPA_DC_FLUSH_FINAL;
             opData.compressAndVerify = CPA_TRUE;
-            
+
             entry->submit_time = clock();
-            
+
             CpaStatus status = cpaDcDecompressData2(ring->dcInstance, ring->sessionHandle,
                                                     entry->pSrcBuffer, entry->pDstBuffer,
                                                     &opData, &entry->dcResults, entry);
-            
+
             if (status == CPA_STATUS_SUCCESS) {
-                __sync_synchronize();
-                entry->status = JOB_SUBMITTED;
-                __sync_synchronize();
-                
+                __atomic_store_n(&entry->status, JOB_SUBMITTED, __ATOMIC_RELEASE);
+                __atomic_store_n(&ring->consumer.submit_head, (sh + 1) & ring->mask, __ATOMIC_RELEASE);
                 __sync_fetch_and_add(&ring->producer.jobs_submitted, 1);
                 submit_count++;
                 retry_count = 0;
-                
+
             } else if (status == CPA_STATUS_RETRY) {
+                //qat_backpressure
                 retry_count++;
                 __builtin_ia32_pause();
+                break;
+
             } else {
-                printf("Decompress: Submit failed: %d\n", status);
-                entry->status = JOB_ERROR;
+                printf("Decompress: Submit failed status=%d seq=%lu\n", status, entry->sequence_number);
+                __atomic_store_n(&entry->status, JOB_ERROR, __ATOMIC_RELEASE);
+                __atomic_store_n(&ring->consumer.submit_head, (sh + 1) & ring->mask, __ATOMIC_RELEASE);
             }
-            
-        } else if (current_status == JOB_COMPLETED) {
-            __sync_fetch_and_add(&ring->decompressed_packets, 1);
-            __sync_fetch_and_add(&ring->decompressed_bytes, entry->producedSize);
-            
-            __sync_synchronize();
-            entry->status = JOB_EMPTY;
-            __sync_synchronize();
-            
-            ring->consumer.head = (current_head + 1) & ring->mask;
-            ring->consumer.jobs_completed++;
-            ring->consumer.jobs_processed++;
-            
-            completed_count++;
-            
-        } else if (current_status == JOB_ERROR) {
-            __sync_fetch_and_add(&ring->decompress_errors, 1);
-            
-            __sync_synchronize();
-            entry->status = JOB_EMPTY;
-            __sync_synchronize();
-            
-            ring->consumer.head = (current_head + 1) & ring->mask;
-            ring->consumer.jobs_processed++;
-            
-        } else if (current_status == JOB_SUBMITTED) {
-            continue;
-            
-        } else if (current_status == JOB_EMPTY) {
-            continue;
+        }
+
+        //drain completed jobs to advance complete head
+        while (true) {
+            uint32_t ch = __atomic_load_n(&ring->consumer.complete_head, __ATOMIC_ACQUIRE);
+            uint32_t sh = __atomic_load_n(&ring->consumer.submit_head, __ATOMIC_ACQUIRE);
+
+            if (ch == sh) break; 
+
+            ring_entry_t *entry = &ring->entries[ch];
+            job_status_t s = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
+
+            if (s == JOB_COMPLETED) {
+                __sync_fetch_and_add(&ring->decompressed_packets, 1);
+                __sync_fetch_and_add(&ring->decompressed_bytes, entry->producedSize);
+                ring->consumer.jobs_completed++;
+                ring->consumer.jobs_processed++;
+                completed_count++;
+
+                __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+                __atomic_store_n(&ring->consumer.complete_head, (ch + 1) & ring->mask, __ATOMIC_RELEASE);
+
+            } else if (s == JOB_ERROR) {
+                __sync_fetch_and_add(&ring->decompress_errors, 1);
+                ring->consumer.jobs_processed++;
+
+                __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+                __atomic_store_n(&ring->consumer.complete_head, (ch + 1) & ring->mask, __ATOMIC_RELEASE);
+
+            } else {
+                // job is still submitted, can't move head
+                break;
+            }
         }
     }
     
+    ///draining at shutdown
     printf("Decompress thread draining remaining jobs...\n");
-    for (int i = 0; i < 10000; i++) {
+    for (int i = 0; i < 50000 && !g_shutdown_requested; i++) {
         icp_sal_DcPollInstance(ring->dcInstance, 0);
+
+        uint32_t ch = ring->consumer.complete_head;
+        uint32_t sh = ring->consumer.submit_head;
+        if (ch == sh) break;
+
+        ring_entry_t *entry = &ring->entries[ch];
+        job_status_t s = __atomic_load_n(&entry->status, __ATOMIC_ACQUIRE);
+        if (s == JOB_COMPLETED || s == JOB_ERROR) {
+            if (s == JOB_COMPLETED) {
+                __sync_fetch_and_add(&ring->decompressed_packets, 1);
+                __sync_fetch_and_add(&ring->decompressed_bytes, entry->producedSize);
+                ring->consumer.jobs_completed++;
+            } else {
+                __sync_fetch_and_add(&ring->decompress_errors, 1);
+            }
+            ring->consumer.jobs_processed++;
+            __atomic_store_n(&entry->status, JOB_EMPTY, __ATOMIC_RELEASE);
+            ring->consumer.complete_head = (ch + 1) & ring->mask;
+            i = 0; 
+        }
     }
     
     printf("Decompress thread exiting (processed: %lu, completed: %lu)\n", 
@@ -511,14 +531,19 @@ void* stats_thread(void *arg)
             double rx_gbps = (byte_delta * 8.0) / (elapsed * 1e9);
             double decomp_gbps = ((decomp_delta + uncomp_delta) * 8.0) / (elapsed * 1e9);
             
-            uint32_t queue_depth = (ring->producer.tail - ring->consumer.head) & ring->mask;
+            // in flight requests are between complete head and submit head
+            uint32_t tail = ring->producer.tail;
+            uint32_t ch   = ring->consumer.complete_head;
+            uint32_t sh   = ring->consumer.submit_head;
+            uint32_t queue_depth    = (tail - ch) & ring->mask;
+            uint32_t inflight_depth = (sh - ch)   & ring->mask;
             
-            printf("RX: %.3f Gbps (wire) | Decompressed: %.3f Gbps | "
-                   "%.0f pkt/s | Q:%u | Submitted:%lu Completed:%lu | Err:%lu\n",
+            printf("RX: %.3f Gbps (wire) | Decomp: %.3f Gbps | "
+                   "%.0f pkt/s | Q:%u InFlight:%u | Sub:%lu Done:%lu Err:%lu | RingFull:%lu\n",
                    rx_gbps, decomp_gbps,
-                   pkt_delta / elapsed, queue_depth, 
+                   pkt_delta / elapsed, queue_depth, inflight_depth,
                    ring->producer.jobs_submitted, ring->consumer.jobs_completed,
-                   ring->decompress_errors);
+                   ring->decompress_errors, ring->ring_full_count);
         }
         
         last_packets = current_packets;
@@ -588,13 +613,11 @@ int main(int argc, char *argv[])
         }
     }
     
-    // Setup signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
-    printf("=== Ring Buffer QAT Receiver ===\n");
+    printf("=== Ring Buffer QAT Receiver (Pipelined) ===\n");
     printf("Workers: %d\n", num_workers);
-    // printf("Press Ctrl+C for graceful shutdown\n\n");
     
     ring_buffer_t *ring = ring_buffer_init(1);
     if (!ring) {
@@ -662,19 +685,22 @@ int main(int argc, char *argv[])
     gettimeofday(&end_time, NULL);
     double elapsed = (end_time.tv_sec - ring->start_time.tv_sec) +
                      (end_time.tv_usec - ring->start_time.tv_usec) / 1e6;
-    double network_in_gbps = (ring->producer.bytes_received * 8.0)/ (elapsed * 1e9);
-    double qat_tput_in = (ring->qat_stats.total_bytes_in * 8.0)/ (elapsed * 1e9);
-    double qat_tput_out = (ring->qat_stats.total_bytes_out * 8.0)/ (elapsed * 1e9);
+    double network_in_gbps    = (ring->producer.bytes_received       * 8.0) / (elapsed * 1e9);
+    double qat_tput_in        = (ring->qat_stats.total_bytes_in      * 8.0) / (elapsed * 1e9);
+    double qat_tput_in_before = (ring->qat_stats.total_bytes_in_before * 8.0) / (elapsed * 1e9);
+    double qat_tput_out       = (ring->qat_stats.total_bytes_out     * 8.0) / (elapsed * 1e9);
     
     printf("\n=== FINAL STATISTICS ===\n");
     printf("Duration: %.2f sec\n", elapsed);
     printf("\nRX Statistics:\n");
-    printf("    RX Network Bytes In: %lu --> Throughput(%.2f Gbps)\n", ring->producer.bytes_received, network_in_gbps);
-    printf("    RX Network Bytes Out: %lu --> Throughput(%.2f Gbps)\n", ring->producer.bytes_received, network_in_gbps);
-    printf("    RX QAT Bytes In: %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_in, qat_tput_in);
-    printf("    RX QAT Bytes Out: %lu --> Throughput(%.2f Gbps)\n",ring->qat_stats.total_bytes_out, qat_tput_out);
-    printf("    RX Uncompressed Packets Recieved: %lu\n", ring->uncompressed_packets_recv);
-    printf("    RX Compressed Packets Recieved: %lu\n",ring->compressed_packets_recv);
+    printf("    RX Network Bytes In:     %lu --> Throughput(%.2f Gbps)\n", ring->producer.bytes_received, network_in_gbps);
+    printf("    RX QAT Bytes In Before:  %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_in_before, qat_tput_in_before);
+    printf("    RX QAT Bytes In:         %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_in, qat_tput_in);
+    printf("    RX QAT Bytes Out:        %lu --> Throughput(%.2f Gbps)\n", ring->qat_stats.total_bytes_out, qat_tput_out);
+    printf("    RX Compressed Packets:   %lu\n", ring->compressed_packets_recv);
+    printf("    RX Uncompressed Packets: %lu\n", ring->uncompressed_packets_recv);
+    printf("    Ring Full (dropped):     %lu\n", ring->ring_full_count);
+    printf("    Decompress Errors:       %lu\n", ring->decompress_errors);
     
     close(sockfd);
     ring_buffer_cleanup(ring);
